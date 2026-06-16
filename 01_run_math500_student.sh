@@ -7,7 +7,7 @@ set -euo pipefail
 
 STUDENT_MODEL="Qwen/Qwen2.5-Math-1.5B"
 TASK="minerva_math500"
-LIMIT=500
+LIMIT=200
 OUT_DIR="outputs/math500_student_qwen25_15b"
 
 # You can override this from command line.
