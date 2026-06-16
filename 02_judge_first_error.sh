@@ -4,6 +4,6 @@ python 02_judge_first_error_chunk.py \
   --student-tokenizer Qwen/Qwen2.5-Math-1.5B \
   --threshold 100 \
   --chunk-size 16 \
-  --max-cases 20 \
+  --max-cases 200 \
   --out outputs/first_error_chunk_judged.jsonl \
   --use-reference-cot
