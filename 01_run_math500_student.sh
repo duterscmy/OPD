@@ -12,7 +12,7 @@ OUT_DIR="outputs/math500_student_qwen25_15b"
 
 # You can override this from command line.
 # Example:
-export GEN_KWARGS="max_gen_toks=2048,temperature=0.7,do_sample=True,top_p=0.95"
+export GEN_KWARGS="max_gen_toks=1024,temperature=0.7,do_sample=True,top_p=0.95"
 # GEN_KWARGS=${GEN_KWARGS:-"max_gen_toks=2048,temperature=0.0,do_sample=False"}
 
 mkdir -p "$OUT_DIR"
