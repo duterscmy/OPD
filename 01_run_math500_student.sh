@@ -25,7 +25,7 @@ echo "Generation kwargs: $GEN_KWARGS"
 
 lm_eval \
   --model hf \
-  --model_args "pretrained=${STUDENT_MODEL},trust_remote_code=True,dtype=bfloat16" \
+  --model_args "pretrained=${STUDENT_MODEL},trust_remote_code=True,dtype=bfloat16,device_map=auto" \
   --tasks "$TASK" \
   --limit "$LIMIT" \
   --batch_size 4 \
