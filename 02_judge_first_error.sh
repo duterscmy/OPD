@@ -3,6 +3,6 @@ python 02_judge_first_error.py \
   --teacher Qwen/Qwen3-4B \
   --student-tokenizer Qwen/Qwen2.5-Math-1.5B \
   --threshold 100 \
-  --max-cases 20 \
+  --max-cases 200 \
   --out outputs/first_error_judged.jsonl \
   --use-reference-cot
