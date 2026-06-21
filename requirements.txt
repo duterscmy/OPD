@@ -1,0 +1,11 @@
+torch>=2.6.0
+trl[peft]==1.6.0
+transformers>=4.56.2
+accelerate>=1.8.0
+datasets>=4.7.0
+peft>=0.17.0
+PyYAML>=6.0
+sentencepiece>=0.2.0
+safetensors>=0.5.0
+math-verify>=0.8.0
+lm_eval[hf,math]>=0.4.9.2
