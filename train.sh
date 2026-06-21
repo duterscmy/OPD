@@ -2,7 +2,7 @@
 #SBATCH --job-name="train_opd"
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
 #SBATCH -o slurm.%j.%N.out
 #SBATCH -e slurm.%j.%N.err
@@ -33,7 +33,7 @@ fi
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-NUM_PROCESSES=4
+NUM_PROCESSES=1
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 
 echo "======================================"
