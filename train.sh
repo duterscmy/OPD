@@ -7,7 +7,6 @@
 #SBATCH -o slurm.%j.%N.out
 #SBATCH -e slurm.%j.%N.err
 
-set -e
 
 ### 激活 conda 环境
 source ~/.bashrc
