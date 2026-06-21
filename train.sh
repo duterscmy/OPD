@@ -44,12 +44,16 @@ echo "NUM_PROCESSES: $NUM_PROCESSES"
 echo "MIXED_PRECISION: $MIXED_PRECISION"
 echo "======================================"
 
+mkdir -p logs
+
+LOG_FILE="logs/train_$(basename "$CONFIG" .yaml)_$(date +%Y%m%d_%H%M%S).log"
+echo "Logging to: $LOG_FILE"
+
 accelerate launch \
   --num_processes "$NUM_PROCESSES" \
   --mixed_precision "$MIXED_PRECISION" \
   train_opd.py \
-  --config "$CONFIG" \
-  "$@"
+  --config "$CONFIG" 2>&1 
 
 echo "======================================"
 echo "Job finished at: $(date)"
