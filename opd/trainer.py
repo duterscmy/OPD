@@ -78,17 +78,43 @@ class AdaptiveOPDTrainer(GKDTrainer):
     def _current_horizon(self) -> int:
         return self.schedule.horizon(int(self.state.global_step))
 
-    def _strip_completion(self, row: torch.Tensor) -> list[int]:
-        ids = []
+    def _strip_completion(self, row: torch.Tensor) -> tuple[list[int], bool]:
+        """Strip padding from a generated completion and record whether EOS appeared.
+
+        Returns:
+            ids: completion token ids, including EOS if EOS was generated.
+            saw_eos: whether EOS was observed before padding / horizon end.
+        """
+        ids: list[int] = []
+        saw_eos = False
         eos = self.processing_class.eos_token_id
         pad = self.processing_class.pad_token_id
         for token in row.tolist():
+            token = int(token)
             if pad is not None and token == pad:
                 break
-            ids.append(int(token))
+            ids.append(token)
             if eos is not None and token == eos:
+                saw_eos = True
                 break
-        return ids
+        return ids, saw_eos
+
+    @staticmethod
+    def _median(values: list[int]) -> float:
+        if not values:
+            return 0.0
+        values = sorted(values)
+        mid = len(values) // 2
+        if len(values) % 2:
+            return float(values[mid])
+        return float(values[mid - 1] + values[mid]) / 2.0
+
+    def _safe_decode(self, ids: list[int], max_chars: int = 2000) -> str:
+        try:
+            text = self.processing_class.decode(ids, skip_special_tokens=False)
+        except Exception:
+            text = str(ids[:128])
+        return text[:max_chars]
 
     @torch.no_grad()
     def _generate_student_rollouts(self, model: Any, inputs: dict[str, Any], horizon: int) -> list[list[int]]:
@@ -115,7 +141,29 @@ class AdaptiveOPDTrainer(GKDTrainer):
                 return_dict_in_generate=True,
             )
         prompt_width = inputs["prompts"].shape[1]
-        return [self._strip_completion(row) for row in outputs.sequences[:, prompt_width:]]
+        completions: list[list[int]] = []
+        eos_flags: list[bool] = []
+        for row in outputs.sequences[:, prompt_width:]:
+            ids, saw_eos = self._strip_completion(row)
+            completions.append(ids)
+            eos_flags.append(saw_eos)
+
+        lengths = [len(ids) for ids in completions]
+        self._last_rollout_diagnostics = {
+            "generated_lengths": lengths,
+            "eos_flags": eos_flags,
+            "empty_generated_fraction": float(sum(x == 0 for x in lengths) / max(len(lengths), 1)),
+            "eos_fraction": float(sum(eos_flags) / max(len(eos_flags), 1)),
+            "truncated_fraction": float(
+                sum((not eos) and (length >= int(horizon)) for length, eos in zip(lengths, eos_flags, strict=True))
+                / max(len(lengths), 1)
+            ),
+            "mean_generated_tokens": float(sum(lengths) / max(len(lengths), 1)),
+            "median_generated_tokens": self._median(lengths),
+            "max_generated_tokens": float(max(lengths) if lengths else 0),
+            "min_generated_tokens": float(min(lengths) if lengths else 0),
+        }
+        return completions
 
     def _reflection_cut_lengths(
         self,
@@ -195,6 +243,64 @@ class AdaptiveOPDTrainer(GKDTrainer):
                 for record in logs:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
         return cut_lengths
+
+    def _maybe_log_rollout_debug(
+        self,
+        inputs: dict[str, Any],
+        completions: list[list[int]],
+        cut_lengths: list[int],
+        horizon: int,
+    ) -> None:
+        """Optionally write a few decoded rollout examples for debugging.
+
+        Enable with config fields:
+          debug_rollout_log_path: path to jsonl file
+          debug_rollout_samples: number of examples per logging event
+          debug_rollout_interval: global-step interval
+        """
+        path_str = self.experiment_config.get("debug_rollout_log_path")
+        if not path_str:
+            return
+        interval = int(self.experiment_config.get("debug_rollout_interval", max(int(self.args.logging_steps), 1)))
+        if interval <= 0 or int(self.state.global_step) % interval != 0:
+            return
+        n = int(self.experiment_config.get("debug_rollout_samples", 2))
+        if n <= 0:
+            return
+
+        path = Path(path_str)
+        if not path.is_absolute():
+            path = Path(self.args.output_dir) / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        diagnostics = getattr(self, "_last_rollout_diagnostics", {})
+        eos_flags = diagnostics.get("eos_flags", [False] * len(completions))
+
+        records = []
+        for i in range(min(n, len(completions))):
+            prompt_ids = inputs["prompts"][i][inputs["prompt_attention_mask"][i].bool()].tolist()
+            completion = completions[i]
+            cut = int(cut_lengths[i])
+            records.append(
+                {
+                    "global_step": int(self.state.global_step),
+                    "rank": int(self.accelerator.process_index),
+                    "sample_index": i,
+                    "horizon": int(horizon),
+                    "generated_tokens": int(len(completion)),
+                    "used_tokens_after_cut": cut,
+                    "saw_eos": bool(eos_flags[i]) if i < len(eos_flags) else False,
+                    "hit_horizon": bool((not eos_flags[i]) and len(completion) >= int(horizon)) if i < len(eos_flags) else False,
+                    "problem": inputs.get("problem", [""] * len(completions))[i],
+                    "prompt_text": self._safe_decode([int(x) for x in prompt_ids]),
+                    "completion_text": self._safe_decode(completion),
+                    "used_completion_text": self._safe_decode(completion[:cut]),
+                }
+            )
+
+        with path.open("a", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _build_student_batch(
         self,
@@ -298,14 +404,34 @@ class AdaptiveOPDTrainer(GKDTrainer):
             self._build_cross_tokenizer_batch(batch)
 
         if self.state.global_step % max(int(self.args.logging_steps), 1) == 0:
-            valid = [x for x in cut_lengths if x > 0]
-            self.log(
-                {
-                    "rollout/horizon": float(horizon),
-                    "rollout/mean_used_tokens": float(sum(valid) / max(len(valid), 1)),
-                    "rollout/skipped_fraction": float(sum(x == 0 for x in cut_lengths) / len(cut_lengths)),
-                }
-            )
+            generated = getattr(self, "_last_rollout_diagnostics", {})
+            valid_used = [int(x) for x in cut_lengths if int(x) > 0]
+            all_used = [int(x) for x in cut_lengths]
+            log_payload = {
+                "rollout/horizon": float(horizon),
+                "rollout/mean_used_tokens": float(sum(valid_used) / max(len(valid_used), 1)),
+                "rollout/median_used_tokens": self._median(valid_used),
+                "rollout/max_used_tokens": float(max(all_used) if all_used else 0),
+                "rollout/min_used_tokens": float(min(all_used) if all_used else 0),
+                "rollout/skipped_fraction": float(sum(x == 0 for x in all_used) / max(len(all_used), 1)),
+                "rollout/mean_generated_tokens": float(generated.get("mean_generated_tokens", 0.0)),
+                "rollout/median_generated_tokens": float(generated.get("median_generated_tokens", 0.0)),
+                "rollout/max_generated_tokens": float(generated.get("max_generated_tokens", 0.0)),
+                "rollout/min_generated_tokens": float(generated.get("min_generated_tokens", 0.0)),
+                "rollout/eos_fraction": float(generated.get("eos_fraction", 0.0)),
+                "rollout/truncated_fraction": float(generated.get("truncated_fraction", 0.0)),
+                "rollout/empty_generated_fraction": float(generated.get("empty_generated_fraction", 0.0)),
+            }
+            if self.strategy == "reflection":
+                generated_lengths = [int(x) for x in generated.get("generated_lengths", [])]
+                if generated_lengths:
+                    log_payload["rollout/mean_tokens_removed_by_reflection"] = float(
+                        sum(max(g - u, 0) for g, u in zip(generated_lengths, all_used, strict=True))
+                        / max(len(all_used), 1)
+                    )
+            self.log(log_payload)
+
+        self._maybe_log_rollout_debug(inputs, completions, cut_lengths, horizon)
 
         return Trainer.training_step(self, model, batch, None)
 
