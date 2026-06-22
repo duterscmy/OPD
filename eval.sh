@@ -14,7 +14,8 @@ conda activate opd
 
 MODEL=$1
 OUTPUT_PATH=$MODEL/eval
-# BATCH_SIZE=${BATCH_SIZE:-auto}
+BASE_MODEL="/lus/lfs1aip2/projects/public/u6nc/mingyu/models/Qwen2.5-Math-1.5B"
+BATCH_SIZE=${BATCH_SIZE:-auto}
 # DEVICE=${DEVICE:-cuda:0}
 # LIMIT=${LIMIT:-}
 APPLY_CHAT_TEMPLATE="1"
