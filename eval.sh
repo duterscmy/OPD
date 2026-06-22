@@ -13,7 +13,7 @@ source ~/.bashrc
 conda activate opd
 
 MODEL=$1
-OUTPUT_PATH=${OUTPUT_PATH:-eval_results/$(basename "$MODEL")}
+OUTPUT_PATH=$MODEL/eval
 # BATCH_SIZE=${BATCH_SIZE:-auto}
 # DEVICE=${DEVICE:-cuda:0}
 # LIMIT=${LIMIT:-}
@@ -34,7 +34,7 @@ echo $EXTRA
 
 lm_eval \
   --model hf \
-  --model_args "pretrained=${MODEL},trust_remote_code=True,dtype=bfloat16" \
+  --model_args "pretrained=${BASE_MODEL},peft=${MODEL},trust_remote_code=True,dtype=bfloat16" \
   --tasks "minerva_math500" \
   --device "$DEVICE" \
   --batch_size "$BATCH_SIZE" \
