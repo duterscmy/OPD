@@ -15,11 +15,12 @@ conda activate opd
 MODEL=$1
 OUTPUT_PATH=$MODEL/eval
 BASE_MODEL="/lus/lfs1aip2/projects/public/u6nc/mingyu/models/Qwen2.5-Math-1.5B"
-BATCH_SIZE=${BATCH_SIZE:-auto}
+BATCH_SIZE=8
+# BATCH_SIZE=${BATCH_SIZE:-auto}
 # DEVICE=${DEVICE:-cuda:0}
 # LIMIT=${LIMIT:-}
 APPLY_CHAT_TEMPLATE="1"
-GEN_KWARGS=${GEN_KWARGS:-max_gen_toks=2048,temperature=0.7,do_sample=True,top_p=1.0}
+GEN_KWARGS=${GEN_KWARGS:-max_gen_toks=256,temperature=0.7,do_sample=True,top_p=1.0}
 NUM_FEWSHOT=${NUM_FEWSHOT:-0}
 
 mkdir -p "$OUTPUT_PATH"
