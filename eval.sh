@@ -44,4 +44,4 @@ lm_eval \
   --gen_kwargs "$GEN_KWARGS" \
   --log_samples \
   --output_path "$OUTPUT_PATH" \
-  "${EXTRA[@]}" #&> "$OUTPUT_PATH/eval.log"
+  "${EXTRA[@]}" &> "$OUTPUT_PATH/eval.log"
