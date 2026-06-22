@@ -52,7 +52,7 @@ accelerate launch \
   --num_processes "$NUM_PROCESSES" \
   --mixed_precision "$MIXED_PRECISION" \
   train_opd.py \
-  --config "$CONFIG" 2>&1 
+  --config "$CONFIG" 2>&1 > "$LOG_FILE"
 
 echo "======================================"
 echo "Job finished at: $(date)"
