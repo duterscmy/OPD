@@ -20,7 +20,7 @@ BATCH_SIZE=8
 # DEVICE=${DEVICE:-cuda:0}
 # LIMIT=${LIMIT:-}
 APPLY_CHAT_TEMPLATE="1"
-GEN_KWARGS=${GEN_KWARGS:-max_gen_toks=256,temperature=0.7,do_sample=True,top_p=1.0}
+GEN_KWARGS=${GEN_KWARGS:-max_new_tokens=256,temperature=0.7,do_sample=True,top_p=1.0}
 NUM_FEWSHOT=${NUM_FEWSHOT:-0}
 
 mkdir -p "$OUTPUT_PATH"
