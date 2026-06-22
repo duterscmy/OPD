@@ -7,7 +7,7 @@
 #SBATCH -o slurm.%j.%N.out
 #SBATCH -e slurm.%j.%N.err
 
-
+sleep 1800
 ### 激活 conda 环境
 source ~/.bashrc
 conda activate opd
