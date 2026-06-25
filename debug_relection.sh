@@ -1,3 +1,5 @@
+### 激活 conda 环境
+source ~/.bashrc
 conda activate opd
 
 python debug_reflection.py \
