@@ -115,15 +115,16 @@ def build_teacher_encoded_rows(
         try:
             ids = teacher_tokenizer.apply_chat_template(
                 messages,
-                tokenize=True,
+                tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=False,
             )
         except TypeError:
             ids = teacher_tokenizer.apply_chat_template(
                 messages,
-                tokenize=True,
+                tokenize=False,
                 add_generation_prompt=True,
+                enable_thinking=False,
             )
 
         ids = normalise_ids(ids, teacher_tokenizer)
