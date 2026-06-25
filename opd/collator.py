@@ -81,14 +81,12 @@ def _normalise_messages(messages: Any) -> list[dict[str, str]]:
 
 
 def _ensure_int_ids(tokenizer, ids_or_text: Any) -> list[int]:
-    """
-    Convert tokenizer output to a flat list[int].
-    Handles:
-      - list[int]
-      - torch.Tensor
-      - string
-      - nested list
-    """
+    if isinstance(ids_or_text, dict):
+        if "input_ids" in ids_or_text:
+            ids_or_text = ids_or_text["input_ids"]
+        else:
+            raise ValueError(f"Tokenizer returned dict without input_ids: {ids_or_text.keys()}")
+
     if isinstance(ids_or_text, torch.Tensor):
         ids_or_text = ids_or_text.detach().cpu().tolist()
 
@@ -131,25 +129,37 @@ def apply_chat_template_ids(
 ) -> list[int]:
     """
     Return token ids for a chat prompt.
-    Robust against tokenizers returning text despite tokenize=True.
+
+    Important:
+    Some tokenizers return a dict like
+      {"input_ids": [...], "attention_mask": [...]}
+    when apply_chat_template(tokenize=True) is used.
+
+    To avoid accidentally encoding that dict as text, we always:
+      apply_chat_template(tokenize=False) -> prompt text
+      tokenizer.encode(prompt text) -> token ids
     """
     messages = _normalise_messages(messages)
 
     if getattr(tokenizer, "chat_template", None):
-        kwargs = {
-            "tokenize": True,
-            "add_generation_prompt": add_generation_prompt,
-        }
         try:
-            ids = tokenizer.apply_chat_template(
+            text = tokenizer.apply_chat_template(
                 messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
                 enable_thinking=False,
-                **kwargs,
             )
         except TypeError:
-            ids = tokenizer.apply_chat_template(messages, **kwargs)
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
 
-        return _ensure_int_ids(tokenizer, ids)
+        if not isinstance(text, str):
+            raise TypeError(f"apply_chat_template(tokenize=False) returned {type(text)}")
+
+        return tokenizer.encode(text, add_special_tokens=False)
 
     # Fallback for base models without chat template.
     lines = []
