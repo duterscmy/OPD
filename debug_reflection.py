@@ -61,12 +61,27 @@ def safe_decode(tokenizer, ids: list[int] | torch.Tensor, max_chars: int | None 
 
 
 def normalise_ids(ids: Any, tokenizer) -> list[int]:
+    # Handle BatchEncoding / dict returned by some chat templates
+    if isinstance(ids, dict):
+        if "input_ids" in ids:
+            ids = ids["input_ids"]
+        else:
+            raise ValueError(f"Tokenizer returned dict without input_ids: {ids.keys()}")
+
     if isinstance(ids, torch.Tensor):
         ids = ids.detach().cpu().tolist()
+
     if isinstance(ids, str):
         ids = tokenizer.encode(ids, add_special_tokens=True)
+
+    # Handle nested list, e.g. [[1,2,3]]
     if isinstance(ids, list) and len(ids) > 0 and isinstance(ids[0], list):
         ids = ids[0]
+
+    # Handle list of tensors
+    if isinstance(ids, list) and len(ids) > 0 and isinstance(ids[0], torch.Tensor):
+        ids = [int(x) for x in torch.cat([t.flatten().cpu() for t in ids]).tolist()]
+
     return [int(x) for x in ids]
 
 
