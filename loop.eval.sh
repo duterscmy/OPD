@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --time=1:00:00
+#SBATCH --time=24:00:00
 #SBATCH -o slurm.%j.%N.out
 #SBATCH -e slurm.%j.%N.err
 
@@ -95,7 +95,7 @@ for MODEL in "${CHECKPOINTS[@]}"; do
     --gen_kwargs "$GEN_KWARGS" \
     --log_samples \
     --output_path "$OUTPUT_PATH" \
-    "${EXTRA[@]}" &> "$OUTPUT_PATH/eval.log"
+    "${EXTRA[@]}" &> "$OUTPUT_PATH/eval.1024.log"
 
   echo "Finished $CKPT_NAME at: $(date)"
 done
