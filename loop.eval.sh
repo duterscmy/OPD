@@ -25,7 +25,7 @@ if [ ! -d "$ROOT_DIR" ]; then
   exit 1
 fi
 
-BASE_MODEL=${BASE_MODEL:-"/lus/lfs1aip2/projects/public/u6nc/mingyu/models/Qwen2.5-Math-1.5B"}
+BASE_MODEL=${BASE_MODEL:-"/lus/lfs1aip2/projects/public/u6nc/mingyu/models/Qwen2.5-Math-1.5B-1024"}
 TASKS=${TASKS:-"minerva_math500"}
 BATCH_SIZE=${BATCH_SIZE:-8}
 DEVICE=${DEVICE:-"cuda:0"}
