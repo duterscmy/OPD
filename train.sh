@@ -7,7 +7,7 @@
 #SBATCH -o slurm.%j.%N.out
 #SBATCH -e slurm.%j.%N.err
 
-set -euo pipefail
+# set -euo pipefail
 
 source ~/.bashrc
 conda activate opd
