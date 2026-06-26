@@ -1,0 +1,6 @@
+strategy: correctness_esr
+correctness_rollout_max_tokens: 1024
+prefix_length: 100
+correctness_wrong_fallback: esr
+answer_extraction: auto
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_correct_full_wrong_esr100

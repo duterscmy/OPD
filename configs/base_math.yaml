@@ -1,0 +1,84 @@
+# Base config for OPD/ESR math experiments.
+seed: 42
+
+model_name_or_path: Qwen/Qwen2.5-Math-1.5B
+teacher_model_name_or_path: Qwen/Qwen3-4B
+trust_remote_code: true
+dtype: bfloat16
+attn_implementation: null
+
+# Important: Qwen2.5-Math-1.5B base should usually NOT use chat template.
+student_use_chat_template: false
+student_enable_thinking: false
+# Qwen3 teacher/judge should usually use chat template, with thinking disabled for JSON judging.
+teacher_use_chat_template: true
+teacher_enable_thinking: false
+
+dataset_name: AI-MO/NuminaMath-1.5
+dataset_split: train
+dataset_adapter: math
+max_train_examples: 3200
+shuffle_dataset: true
+system_prompt: "Please reason step by step, and put your final answer within \\boxed{}."
+user_prompt_template: "Solve the following mathematics problem. Show your reasoning clearly and put the final answer in \\boxed{{}}.\n\n{problem}"
+
+max_length: 4096
+max_prompt_length: 2048
+
+full_max_new_tokens: 1024
+prefix_length: 100
+curriculum_lengths: [50, 100, 200]
+curriculum_boundaries: [0, 67, 134]
+
+reflection_rollout_max_tokens: 1024
+reflection_chunk_size: 32
+reflection_max_new_tokens: 512
+reflection_use_reference: true
+reflection_parse_failure: esr
+reflection_fallback_length: 100
+reflection_min_keep_tokens: 0
+reflection_log_path: null
+
+correctness_rollout_max_tokens: 1024
+correctness_wrong_fallback: esr
+answer_extraction: auto
+
+temperature: 0.7
+top_p: 1.0
+top_k: 0
+rollout_do_sample: true
+
+loss_backend: auto
+lmbda: 1.0
+beta: 1.0
+seq_kd: false
+minimum_aligned_chars: 1
+rkl_advantage_clip: null
+
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_base
+max_steps: 200
+learning_rate: 5.0e-5
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+save_steps: 50
+logging_steps: 1
+warmup_ratio: 0.03
+warmup_steps: null
+weight_decay: 0.0
+lr_scheduler_type: constant
+gradient_checkpointing: true
+num_workers: 0
+report_to: none
+save_only_model: false
+resume_from_checkpoint: null
+
+use_lora: true
+lora_r: 32
+lora_alpha: 64
+lora_dropout: 0.0
+lora_target_modules: all-linear
+
+debug_print_every_step: true
+debug_print_samples: 1
+debug_print_max_chars: 2500
+debug_log_jsonl: debug_steps.jsonl
