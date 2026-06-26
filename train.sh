@@ -49,7 +49,7 @@ accelerate launch \
   --mixed_precision "$MIXED_PRECISION" \
   train_opd.py \
   --config "$CONFIG" \
-  "$@" 2>&1 | tee "$LOG_FILE"
+  "$@" #2>&1 | tee "$LOG_FILE"
 
 EXIT_CODE=${PIPESTATUS[0]}
 echo "======================================"
