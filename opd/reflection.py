@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from .collator import apply_chat_template_ids
+from .collator import apply_chat_template_ids, apply_chat_template_to_text
 
 
 @dataclass
@@ -17,6 +17,7 @@ class ReflectionDecision:
     earliest_error_span: str
     explanation: str
     raw_output: str
+    parsed: dict[str, Any] | None = None
 
 
 def split_token_chunks(tokenizer: Any, token_ids: list[int], chunk_size: int) -> list[dict[str, Any]]:
@@ -46,16 +47,33 @@ def build_reflection_prompt(
     chunk_text = "\n".join(f"[{c['id']}] {c['text']}" for c in chunks)
     return f"""You are a strict mathematical reasoning verifier.
 
-Identify the earliest numbered chunk in which the student's reasoning first becomes mathematically wrong,
-unsupported, contradictory, or irrecoverably incomplete. The erroneous chunk itself must not be used for
-knowledge-distillation training; only chunks before it are considered correct.
+Your task is to identify the earliest numbered chunk where the student's mathematical reasoning first becomes wrong.
 
-Rules:
-- Ignore style and formatting issues.
-- If the whole solution is mathematically correct, return has_error=false.
-- If there is an error, return the earliest erroneous chunk id, not a later consequence.
-- earliest_error_span must be a short verbatim quote from that numbered chunk.
-- Return JSON only, with no markdown and no text outside JSON.
+Important:
+The chunks are arbitrary token chunks. A chunk may start or end in the middle of a sentence.
+Do NOT mark a chunk as erroneous merely because it is incomplete, truncated, awkward, or starts/ends mid-sentence.
+Do NOT mark formatting, wording, or style issues as mathematical errors.
+Judge the student's reasoning in context across all chunks.
+
+A chunk should be marked as erroneous only if it introduces one of the following:
+- a wrong mathematical setup
+- a false formula or theorem application
+- an invalid inference
+- an arithmetic or algebraic error
+- a contradiction with the problem
+- an unsupported mathematical claim that is necessary for the solution
+- an irrelevant generation that switches to another problem
+- an irrecoverable omission that makes the final answer unsupported
+
+If the student has not yet made a clear mathematical claim, do not mark it as an error.
+If the student later self-corrects a tentative false start, do not cut before the self-correction.
+If the solution is mathematically correct, return has_error=false.
+If there is an error, return the earliest chunk id that introduces the mathematical error, not a later consequence.
+
+Return ONLY valid JSON.
+Do not use markdown.
+Do not output chain-of-thought.
+earliest_error_span should be a short plain-text quote, and may be empty if quoting is difficult.
 
 Problem:
 {problem}
@@ -63,30 +81,45 @@ Problem:
 Student solution chunks:
 {chunk_text}
 
-Schema:
+Schema for an erroneous solution:
 {{
   "has_error": true,
   "earliest_error_chunk_id": 0,
-  "earliest_error_span": "verbatim quote",
-  "explanation": "brief mathematical explanation"
+  "earliest_error_span": "",
+  "error_type": "wrong_setup | wrong_formula | algebra_error | arithmetic_error | invalid_inference | contradiction | unsupported_claim | irrelevant_generation | irrecoverable_omission",
+  "explanation": "brief explanation of the mathematical error"
 }}
 
-For a fully correct solution:
+Schema for a correct solution:
 {{
   "has_error": false,
   "earliest_error_chunk_id": null,
   "earliest_error_span": "",
-  "explanation": "The solution is correct."
+  "error_type": "none",
+  "explanation": "The solution is mathematically correct."
 }}
 """
+
+
+def _repair_json_string(s: str) -> str:
+    # Common invalid escapes emitted by LLMs inside JSON strings.
+    s = s.replace("\\{", "{").replace("\\}", "}")
+    s = s.replace("\\_", "_")
+    # Remove invalid escape before dollar if present.
+    s = s.replace("\\$", "$")
+    return s
 
 
 def extract_json(text: str) -> dict[str, Any] | None:
     original = text.strip()
     if "</think>" in original:
         original = original.split("</think>", 1)[1].strip()
+    if original.startswith("<think>"):
+        return None
     original = re.sub(r"^```(?:json)?", "", original).strip()
     original = re.sub(r"```$", "", original).strip()
+    original = _repair_json_string(original)
+
     try:
         return json.loads(original)
     except Exception:
@@ -115,11 +148,21 @@ def extract_json(text: str) -> dict[str, Any] | None:
             elif c == "}":
                 depth -= 1
                 if depth == 0:
+                    candidate = _repair_json_string(original[start : end + 1])
                     try:
-                        return json.loads(original[start : end + 1])
+                        return json.loads(candidate)
                     except Exception:
                         break
     return None
+
+
+def strip_thinking(text: str) -> str:
+    text = text.strip()
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1].strip()
+    if text.startswith("<think>"):
+        return ""
+    return text
 
 
 @torch.no_grad()
@@ -128,17 +171,30 @@ def judge_batch(
     teacher_tokenizer: Any,
     prompts: list[str],
     max_new_tokens: int,
-) -> list[ReflectionDecision]:
+    use_chat_template: bool = True,
+    enable_thinking: bool = False,
+    return_prompt_texts: bool = False,
+) -> list[ReflectionDecision] | tuple[list[ReflectionDecision], list[str]]:
     encoded_rows = []
+    prompt_texts = []
     for prompt in prompts:
         messages = [
             {
                 "role": "system",
-                "content": "Return only valid JSON. Do not reveal chain-of-thought or use markdown.",
+                "content": "Return only valid JSON. Do not reveal chain-of-thought. Do not output <think>. Do not use markdown.",
             },
             {"role": "user", "content": prompt},
         ]
-        encoded_rows.append(apply_chat_template_ids(teacher_tokenizer, messages, add_generation_prompt=True))
+        prompt_text = apply_chat_template_to_text(
+            teacher_tokenizer,
+            messages,
+            add_generation_prompt=True,
+            use_chat_template=use_chat_template,
+            enable_thinking=enable_thinking,
+        )
+        ids = [int(x) for x in teacher_tokenizer.encode(prompt_text, add_special_tokens=False)]
+        encoded_rows.append(ids)
+        prompt_texts.append(prompt_text)
 
     if teacher_tokenizer.pad_token_id is None:
         teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
@@ -160,12 +216,14 @@ def judge_batch(
         use_cache=True,
     )
 
-    decisions = []
-    for row in outputs[:, width:]:
-        raw = teacher_tokenizer.decode(row, skip_special_tokens=True)
+    prompt_width = input_ids.shape[1]
+    decisions: list[ReflectionDecision] = []
+    for row in outputs[:, prompt_width:]:
+        raw = teacher_tokenizer.decode(row, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        raw = strip_thinking(raw)
         parsed = extract_json(raw)
         if parsed is None:
-            decisions.append(ReflectionDecision(None, None, "", "JSON parse failure", raw))
+            decisions.append(ReflectionDecision(None, None, "", "JSON parse failure", raw, None))
             continue
         has_error = parsed.get("has_error")
         if not isinstance(has_error, bool):
@@ -182,6 +240,9 @@ def judge_batch(
                 earliest_error_span=str(parsed.get("earliest_error_span", "")),
                 explanation=str(parsed.get("explanation", "")),
                 raw_output=raw,
+                parsed=parsed,
             )
         )
+    if return_prompt_texts:
+        return decisions, prompt_texts
     return decisions

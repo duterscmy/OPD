@@ -3,10 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 
-import torch
 from peft import LoraConfig
 from transformers import AutoTokenizer, set_seed
 from trl.experimental.gkd import GKDConfig
@@ -20,13 +18,7 @@ from opd.trainer import AdaptiveOPDTrainer
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="OPD / ESR experiments using TRL GKDTrainer")
     parser.add_argument("--config", required=True, help="YAML configuration file")
-    parser.add_argument(
-        "--set",
-        action="append",
-        default=[],
-        metavar="KEY=VALUE",
-        help="Override a YAML value. Can be repeated.",
-    )
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="Override YAML value. Can be repeated.")
     return parser.parse_args()
 
 
@@ -60,24 +52,28 @@ def main() -> None:
         tokenizer=student_tokenizer,
         max_length=int(cfg["max_length"]),
         max_prompt_length=int(cfg["max_prompt_length"]),
+        use_chat_template=bool(cfg.get("student_use_chat_template", True)),
+        enable_thinking=bool(cfg.get("student_enable_thinking", False)),
     )
 
+    attn_impl = cfg.get("attn_implementation")
     model_init_kwargs = {
         "trust_remote_code": bool(cfg["trust_remote_code"]),
         "dtype": cfg["dtype"],
-        "attn_implementation": cfg["attn_implementation"],
         "use_cache": not bool(cfg["gradient_checkpointing"]),
         "low_cpu_mem_usage": True,
     }
     teacher_init_kwargs = {
         "trust_remote_code": bool(cfg["trust_remote_code"]),
         "dtype": cfg["dtype"],
-        "attn_implementation": cfg["attn_implementation"],
         "use_cache": True,
         "low_cpu_mem_usage": True,
     }
+    if attn_impl:
+        model_init_kwargs["attn_implementation"] = attn_impl
+        teacher_init_kwargs["attn_implementation"] = attn_impl
 
-    training_args = GKDConfig(
+    gkd_kwargs = dict(
         output_dir=str(output_dir),
         max_steps=int(cfg["max_steps"]),
         learning_rate=float(cfg["learning_rate"]),
@@ -85,7 +81,6 @@ def main() -> None:
         gradient_accumulation_steps=int(cfg["gradient_accumulation_steps"]),
         save_steps=int(cfg["save_steps"]),
         logging_steps=int(cfg["logging_steps"]),
-        warmup_ratio=float(cfg["warmup_ratio"]),
         weight_decay=float(cfg["weight_decay"]),
         lr_scheduler_type=cfg["lr_scheduler_type"],
         seed=int(cfg["seed"]),
@@ -112,9 +107,15 @@ def main() -> None:
         eval_strategy="no",
         do_eval=False,
     )
+    if cfg.get("warmup_steps") is not None:
+        gkd_kwargs["warmup_steps"] = int(cfg["warmup_steps"])
+    else:
+        gkd_kwargs["warmup_ratio"] = float(cfg["warmup_ratio"])
+
+    training_args = GKDConfig(**gkd_kwargs)
 
     peft_config = None
-    if cfg["use_lora"]:
+    if bool(cfg["use_lora"]):
         peft_config = LoraConfig(
             r=int(cfg["lora_r"]),
             lora_alpha=int(cfg["lora_alpha"]),
@@ -143,13 +144,12 @@ def main() -> None:
             "student": cfg["model_name_or_path"],
             "teacher": cfg["teacher_model_name_or_path"],
             "dataset": cfg["dataset_name"],
+            "student_use_chat_template": cfg.get("student_use_chat_template"),
+            "teacher_use_chat_template": cfg.get("teacher_use_chat_template"),
             "loss_backend": trainer.loss_backend,
             "same_tokenizer": trainer.same_tokenizer,
-            "global_batch_size": (
-                int(cfg["per_device_train_batch_size"])
-                * int(cfg["gradient_accumulation_steps"])
-                * trainer.accelerator.num_processes
-            ),
+            "global_batch_size": int(cfg["per_device_train_batch_size"]) * int(cfg["gradient_accumulation_steps"]) * trainer.accelerator.num_processes,
+            "resume_from_checkpoint": cfg.get("resume_from_checkpoint"),
         }, indent=2))
 
     trainer.train(resume_from_checkpoint=cfg.get("resume_from_checkpoint"))
