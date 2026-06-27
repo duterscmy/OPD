@@ -20,7 +20,7 @@ TASKS=${TASKS:-minerva_math500}
 DEVICE=${DEVICE:-cuda:0}
 BATCH_SIZE=${BATCH_SIZE:-4}
 NUM_FEWSHOT=${NUM_FEWSHOT:-0}
-GEN_KWARGS=${GEN_KWARGS:-"max_gen_toks=1024,temperature=0.0,do_sample=False"}
+GEN_KWARGS=${GEN_KWARGS:-"max_gen_toks=2048,temperature=0.0,do_sample=False"}
 APPLY_CHAT_TEMPLATE=${APPLY_CHAT_TEMPLATE:-1}
 OUTPUT_PATH=${OUTPUT_PATH:-eval_results/$(basename "$MODEL")}
 mkdir -p "$OUTPUT_PATH"
