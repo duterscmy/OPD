@@ -1,4 +1,5 @@
 strategy: esr
 prefix_length: 200
 max_train_examples: 32000
+max_steps: 400
 output_dir: outputs/qwen25_math_15b_to_qwen3_4b_esr200_norepeatsample
