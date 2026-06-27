@@ -3,11 +3,11 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --time=4:00:00
+#SBATCH --time=6:00:00
 #SBATCH -o slurm.%j.%N.out
 #SBATCH -e slurm.%j.%N.err
 
-set -euo pipefail
+# set -euo pipefail
 source ~/.bashrc
 conda activate opd
 
@@ -43,4 +43,4 @@ lm_eval \
   --gen_kwargs "$GEN_KWARGS" \
   --log_samples \
   --output_path "$OUTPUT_PATH" \
-  "${EXTRA[@]}" 2>&1 | tee "$OUTPUT_PATH/eval.log"
+  "${EXTRA[@]}" 2>&1 | tee "$OUTPUT_PATH/eval.$TASKS.log"
