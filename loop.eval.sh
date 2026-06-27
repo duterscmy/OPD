@@ -31,7 +31,7 @@ BATCH_SIZE=${BATCH_SIZE:-8}
 DEVICE=${DEVICE:-"cuda:0"}
 LIMIT=${LIMIT:-}
 APPLY_CHAT_TEMPLATE=${APPLY_CHAT_TEMPLATE:-"1"}
-GEN_KWARGS=${GEN_KWARGS:-"max_gen_toks=256,temperature=0.7,do_sample=True,top_p=1.0"}
+GEN_KWARGS=${GEN_KWARGS:-"max_gen_toks=1024,temperature=0.0,do_sample=False,top_p=1.0"}
 NUM_FEWSHOT=${NUM_FEWSHOT:-0}
 
 LOG_ROOT="${ROOT_DIR}/eval"
