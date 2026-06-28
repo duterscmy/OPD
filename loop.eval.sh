@@ -13,12 +13,19 @@ source ~/.bashrc
 conda activate opd
 
 if [ $# -lt 1 ]; then
-  echo "Usage: sbatch eval_all_checkpoints.sh /path/to/experiment_dir"
+  echo "Usage: sbatch eval_all_checkpoints.sh /path/to/experiment_dir [min_checkpoint_step]"
   echo "Example: sbatch eval_all_checkpoints.sh outputs/qwen25_math_esr100"
+  echo "Example: sbatch eval_all_checkpoints.sh outputs/qwen25_math_esr100 200"
   exit 1
 fi
 
 ROOT_DIR="$1"
+MIN_CKPT_STEP="${2:-0}"
+
+if ! [[ "$MIN_CKPT_STEP" =~ ^[0-9]+$ ]]; then
+  echo "Error: min_checkpoint_step must be a non-negative integer, got: $MIN_CKPT_STEP"
+  exit 1
+fi
 
 if [ ! -d "$ROOT_DIR" ]; then
   echo "Error: ROOT_DIR does not exist: $ROOT_DIR"
@@ -39,6 +46,7 @@ mkdir -p "$LOG_ROOT"
 
 echo "======================================"
 echo "Eval root dir: $ROOT_DIR"
+echo "Min checkpoint step: $MIN_CKPT_STEP"
 echo "Base model: $BASE_MODEL"
 echo "Tasks: $TASKS"
 echo "Batch size: $BATCH_SIZE"
@@ -51,15 +59,25 @@ echo "======================================"
 
 mapfile -t CHECKPOINTS < <(
   find "$ROOT_DIR" -maxdepth 1 -type d -name "checkpoint-*" \
+    | awk -v min_step="$MIN_CKPT_STEP" '
+        {
+          path = $0
+          name = $0
+          sub(/^.*checkpoint-/, "", name)
+          if (name ~ /^[0-9]+$/ && name + 0 >= min_step) {
+            print path
+          }
+        }
+      ' \
     | sort -V
 )
 
 if [ ${#CHECKPOINTS[@]} -eq 0 ]; then
-  echo "Error: no checkpoint-* directories found under $ROOT_DIR"
+  echo "Error: no checkpoint-* directories >= checkpoint-${MIN_CKPT_STEP} found under $ROOT_DIR"
   exit 1
 fi
 
-echo "Found ${#CHECKPOINTS[@]} checkpoints:"
+echo "Found ${#CHECKPOINTS[@]} checkpoints after filtering:"
 printf '  %s\n' "${CHECKPOINTS[@]}"
 
 for MODEL in "${CHECKPOINTS[@]}"; do
