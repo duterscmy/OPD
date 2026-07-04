@@ -1,0 +1,10 @@
+base_config: configs/base_math.yaml
+strategy: full
+full_max_new_tokens: 1024
+opd_loss_mode: forward_kl
+loss_backend: trl_gjsd
+kd_top_k: 16
+forward_top_k: 32   # can increase this, e.g. 64/128, to teach more teacher support
+overlap_top_k: 16
+kl_renorm_topk: true
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_full_forward

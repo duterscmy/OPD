@@ -1,0 +1,15 @@
+base_config: configs/base_math.yaml
+strategy: full
+full_max_new_tokens: 1024
+opd_loss_mode: prune_opd_lite
+loss_backend: trl_gjsd
+kd_top_k: 16
+reverse_top_k: 16
+overlap_top_k: 16
+prune_overlap_threshold: 0.7
+prune_w_drop: 0.01
+prune_w_base: 0.5
+prune_cumulative: true
+prune_base_loss: reverse_kl
+kl_renorm_topk: true
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_prune_opd_lite
