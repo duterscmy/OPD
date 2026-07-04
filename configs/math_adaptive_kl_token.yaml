@@ -2,7 +2,7 @@ base_config: configs/base_math.yaml
 strategy: full
 full_max_new_tokens: 1024
 opd_loss_mode: adaptive_kl
-loss_backend: trl_gjsd
+loss_backend: sampled_rkl
 # Token-level adaptive controller:
 # high overlap -> reverse KL; medium overlap -> forward KL; very low overlap -> downweighted forward repair.
 adaptive_granularity: token

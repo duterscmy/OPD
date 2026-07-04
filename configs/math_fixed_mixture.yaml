@@ -2,7 +2,7 @@ base_config: configs/base_math.yaml
 strategy: full
 full_max_new_tokens: 1024
 opd_loss_mode: fixed_mixture
-loss_backend: trl_gjsd
+loss_backend: sampled_rkl
 mixture_forward_alpha: 0.5   # loss = alpha * forward_KL + (1-alpha) * reverse_KL
 reverse_top_k: 16
 forward_top_k: 32
