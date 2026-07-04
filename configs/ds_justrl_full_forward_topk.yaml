@@ -1,0 +1,11 @@
+base_config: configs/base_ds_justrl_1p5b.yaml
+# Full OPD here means all rollout response tokens are used for loss.
+# Forward KL uses teacher top-k support, not full-vocabulary KL.
+strategy: full
+full_max_new_tokens: 1024
+opd_loss_mode: forward_kl
+loss_backend: topk_kl
+forward_top_k: 64
+overlap_top_k: 16
+kl_renorm_topk: true
+output_dir: outputs/ds_r1qwen_1p5b_to_justrl_1p5b_full_forward_topk64

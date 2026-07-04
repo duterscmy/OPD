@@ -1,0 +1,9 @@
+base_config: configs/base_ds_justrl_1p5b.yaml
+strategy: esr
+prefix_length: 100
+opd_loss_mode: reverse_kl
+loss_backend: topk_kl
+reverse_top_k: 16
+overlap_top_k: 16
+kl_renorm_topk: true
+output_dir: outputs/ds_r1qwen_1p5b_to_justrl_1p5b_esr100_reverse_topk

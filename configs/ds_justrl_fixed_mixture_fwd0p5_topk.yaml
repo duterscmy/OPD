@@ -1,0 +1,12 @@
+base_config: configs/base_ds_justrl_1p5b.yaml
+# Full rollout span. Mixture uses top-k forward KL + top-k reverse KL.
+strategy: full
+full_max_new_tokens: 1024
+opd_loss_mode: fixed_mixture
+loss_backend: topk_kl
+mixture_forward_alpha: 0.5
+reverse_top_k: 16
+forward_top_k: 64
+overlap_top_k: 16
+kl_renorm_topk: true
+output_dir: outputs/ds_r1qwen_1p5b_to_justrl_1p5b_fixed_mix_fwd0p5_topk
