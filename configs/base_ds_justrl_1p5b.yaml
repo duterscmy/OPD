@@ -113,3 +113,5 @@ debug_print_every_step: false
 debug_print_samples: 1
 debug_print_max_chars: 2500
 debug_log_jsonl: debug_steps.jsonl
+debug_train_log: true
+debug_train_log_steps: 1
