@@ -5,8 +5,8 @@ full_max_new_tokens: 1024
 opd_loss_mode: adaptive_kl
 loss_backend: topk_kl
 adaptive_granularity: token
-adaptive_low_threshold: 0.3
-adaptive_high_threshold: 0.7
+adaptive_low_threshold: 0.0
+adaptive_high_threshold: 0.95
 adaptive_low_action: downweight
 adaptive_low_weight: 0.2
 adaptive_medium_weight: 1.0
@@ -15,4 +15,4 @@ reverse_top_k: 16
 forward_top_k: 64
 overlap_top_k: 16
 kl_renorm_topk: true
-output_dir: outputs/ds_r1qwen_1p5b_to_justrl_1p5b_adaptive_kl_token_topk
+output_dir: outputs/ds_r1qwen_1p5b_to_justrl_1p5b_adaptive_kl_token_topk_threshold0.95
