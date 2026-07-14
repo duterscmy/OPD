@@ -6,10 +6,10 @@ opd_loss_mode: prune_opd_lite
 loss_backend: topk_kl
 reverse_top_k: 16
 overlap_top_k: 16
-prune_overlap_threshold: 0.95
+prune_overlap_threshold: 0.80
 prune_w_drop: 0.01
 prune_w_base: 0.5
 prune_cumulative: true
 prune_base_loss: reverse_kl
 kl_renorm_topk: true
-output_dir: outputs/ds_r1qwen_1p5b_to_justrl_1p5b_prune_opd_lite_topk_threshold0.95
+output_dir: outputs/ds_r1qwen_1p5b_to_justrl_1p5b_prune_opd_lite_topk_threshold0.80
