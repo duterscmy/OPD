@@ -6,8 +6,8 @@ loss_backend: sampled_rkl
 # Token-level adaptive controller:
 # high overlap -> reverse KL; medium overlap -> forward KL; very low overlap -> downweighted forward repair.
 adaptive_granularity: token
-adaptive_low_threshold: 0.3
-adaptive_high_threshold: 0.7
+adaptive_low_threshold: 0.0
+adaptive_high_threshold: 0.8
 adaptive_low_action: downweight   # downweight | forward | reverse | skip
 adaptive_low_weight: 0.2
 adaptive_medium_weight: 1.0

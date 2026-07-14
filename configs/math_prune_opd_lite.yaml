@@ -6,7 +6,7 @@ loss_backend: sampled_rkl
 kd_top_k: 16
 reverse_top_k: 16
 overlap_top_k: 16
-prune_overlap_threshold: 0.7
+prune_overlap_threshold: 0.8
 prune_w_drop: 0.01
 prune_w_base: 0.5
 prune_cumulative: true

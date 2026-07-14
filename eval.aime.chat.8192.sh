@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --time=2:00:00
+#SBATCH --time=5:00:00
 #SBATCH -o slurm.%j.%N.out
 #SBATCH -e slurm.%j.%N.err
 
@@ -24,7 +24,7 @@ BATCH_SIZE=${BATCH_SIZE:-1}
 NUM_FEWSHOT=${NUM_FEWSHOT:-0}
 
 # AIME reasoning needs longer generation budget
-GEN_KWARGS=${GEN_KWARGS:-"max_gen_toks=4096,temperature=0.6,do_sample=True,top_p=0.95"}
+GEN_KWARGS=${GEN_KWARGS:-"max_gen_toks=8192,temperature=0.6,do_sample=True,top_p=0.95"}
 
 APPLY_CHAT_TEMPLATE=${APPLY_CHAT_TEMPLATE:-1}
 
@@ -63,4 +63,4 @@ lm_eval \
   --log_samples \
   --output_path "$OUTPUT_PATH" \
   "${EXTRA[@]}" \
-  2>&1 | tee "$OUTPUT_PATH/eval.aime24.length4096.num_fewshot${NUM_FEWSHOT}.log"
+  2>&1 | tee "$OUTPUT_PATH/eval.aime24.length8192.num_fewshot${NUM_FEWSHOT}.log"

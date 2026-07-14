@@ -20,7 +20,7 @@ dataset_adapter: math
 max_train_examples: 3200
 shuffle_dataset: true
 system_prompt: "Please reason step by step, and put your final answer within \\boxed{}."
-user_prompt_template: "Solve the following mathematics problem. Show your reasoning clearly and put the final answer in \\boxed{{}}.\n\n{problem}"
+user_prompt_template: "{problem}"
 
 max_length: 4096
 max_prompt_length: 2048
