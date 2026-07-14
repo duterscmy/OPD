@@ -43,9 +43,6 @@ class AdaptiveOPDTrainer(GKDTrainer):
     Strategies:
       - full: full student rollout, distill all generated tokens.
       - esr: generate and distill only prefix_length tokens.
-      - curriculum: horizon follows curriculum_lengths / curriculum_boundaries.
-      - reflection: generate long rollout, teacher localizes first error, distill only preceding prefix.
-      - correctness_esr: generate long rollout, if final answer correct use full rollout, else use ESR prefix.
     """
 
     def __init__(
