@@ -317,6 +317,11 @@ class AdaptiveKLTrainer(BaseAdaptiveOPDTrainer):
             teacher_logits_raw=teacher_outputs.logits,
             labels=inputs["labels"],
             cfg=self.experiment_config,
+            tokenizer_alignment=getattr(
+                self,
+                "tokenizer_alignment",
+                None,
+            ),
         )
 
         self._sync_cuda_if_needed()

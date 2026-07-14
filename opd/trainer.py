@@ -11,6 +11,7 @@ from trl.experimental.gkd import GKDTrainer
 from trl.models.utils import unwrap_model_for_generation
 
 from .alignment import build_text_span_alignment
+from .tokenizer_alignment import build_tokenizer_alignment
 from .answers import judge_correctness
 from .collator import apply_chat_template_ids
 from .reflection import build_reflection_prompt, judge_batch, split_token_chunks
@@ -73,6 +74,23 @@ class AdaptiveOPDTrainer(GKDTrainer):
         )
 
         self.same_tokenizer = _tokenizers_identical(self.processing_class, teacher_tokenizer)
+
+        # New cross-tokenizer alignment support.
+        # Keep old behavior for identical tokenizers.
+        self.tokenizer_alignment = build_tokenizer_alignment(
+            self.processing_class,
+            teacher_tokenizer,
+        )
+
+        if self.accelerator.is_main_process:
+            print(
+                {
+                    "tokenizer_shared_ratio": self.tokenizer_alignment.shared_ratio,
+                    "teacher_only_tokens": self.tokenizer_alignment.teacher_only,
+                    "student_only_tokens": self.tokenizer_alignment.student_only,
+                }
+            )
+
         requested = experiment_config.get("loss_backend", "auto")
         if requested == "auto":
             self.loss_backend = "trl_gjsd" if self.same_tokenizer else "sampled_rkl"

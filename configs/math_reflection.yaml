@@ -1,8 +1,0 @@
-strategy: reflection
-reflection_rollout_max_tokens: 1024
-reflection_chunk_size: 32
-reflection_max_new_tokens: 512
-reflection_use_reference: true
-reflection_parse_failure: esr
-reflection_fallback_length: 100
-output_dir: outputs/qwen25_math_15b_to_qwen3_4b_reflection

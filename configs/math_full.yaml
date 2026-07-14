@@ -1,3 +1,0 @@
-# Inherits defaults through code. Full OPD.
-strategy: full
-output_dir: outputs/qwen25_math_15b_to_qwen3_4b_full

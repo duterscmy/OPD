@@ -7,6 +7,118 @@ from typing import Any, Dict, Tuple
 import torch
 import torch.nn.functional as F
 
+from .tokenizer_alignment import map_teacher_topk_to_student
+
+
+
+
+def _use_cross_tokenizer(tokenizer_alignment):
+    return (
+        tokenizer_alignment is not None
+        and hasattr(tokenizer_alignment, "teacher_to_student")
+        and hasattr(tokenizer_alignment, "student_to_teacher")
+    )
+
+
+def _map_ids(ids, mapping):
+    out = torch.full_like(ids, -1)
+    for src, dst in mapping.items():
+        out[ids == src] = dst
+    return out
+
+
+def _cross_tokenizer_forward_kl_topk(
+    student_logits,
+    teacher_logits,
+    mask,
+    k,
+    tokenizer_alignment,
+):
+    """Forward KL with teacher top-k projected to student vocabulary."""
+    k = min(k, teacher_logits.shape[-1])
+
+    with torch.no_grad():
+        teacher_ids = torch.topk(
+            teacher_logits.float(), k=k, dim=-1
+        ).indices
+
+        student_ids = _map_ids(
+            teacher_ids,
+            tokenizer_alignment.teacher_to_student,
+        )
+
+        valid = student_ids.ge(0)
+        student_ids = student_ids.clamp_min(0)
+
+        teacher_logp = _selected_log_probs(
+            teacher_logits,
+            teacher_ids,
+        )
+        teacher_prob = F.softmax(
+            teacher_logp,
+            dim=-1,
+        )
+
+    student_logp = _selected_log_probs(
+        student_logits,
+        student_ids,
+    )
+
+    loss = -(teacher_prob * student_logp).sum(-1)
+    loss = loss * valid.float().mean(-1)
+
+    return loss.masked_fill(~mask, 0)
+
+
+def _cross_tokenizer_reverse_kl_topk(
+    student_logits,
+    teacher_logits,
+    mask,
+    k,
+    tokenizer_alignment,
+):
+    """Reverse KL with student top-k projected to teacher vocabulary."""
+    k = min(k, student_logits.shape[-1])
+
+    student_ids = torch.topk(
+        student_logits.detach().float(),
+        k=k,
+        dim=-1,
+    ).indices
+
+    with torch.no_grad():
+        teacher_ids = _map_ids(
+            student_ids,
+            tokenizer_alignment.student_to_teacher,
+        )
+
+        valid = teacher_ids.ge(0)
+        teacher_ids = teacher_ids.clamp_min(0)
+
+        teacher_logp = _selected_log_probs(
+            teacher_logits,
+            teacher_ids,
+        )
+
+    student_logp = _selected_log_probs(
+        student_logits,
+        student_ids,
+    )
+
+    student_logp = F.log_softmax(student_logp, dim=-1)
+    teacher_logp = F.log_softmax(teacher_logp, dim=-1)
+
+    student_prob = student_logp.exp()
+
+    loss = (
+        student_prob *
+        (student_logp - teacher_logp)
+    ).sum(-1)
+
+    loss = loss * valid.float().mean(-1)
+
+    return loss.masked_fill(~mask, 0)
+
 
 @dataclass
 class AdaptiveKLLossOutput:
@@ -101,6 +213,56 @@ def _reverse_kl_topk(student_logits, teacher_logits, mask, k):
     ).sum(-1)
 
     return loss.masked_fill(~mask, 0)
+
+
+
+
+def _topk_overlap_aligned(
+    student_logits,
+    teacher_logits,
+    mask,
+    k,
+    tokenizer_alignment=None,
+):
+    """
+    Cross-tokenizer top-k overlap.
+
+    Teacher top-k token ids are mapped into student vocabulary
+    before computing overlap.
+    """
+
+    k = min(k, student_logits.shape[-1])
+
+    s_ids = torch.topk(
+        student_logits.detach().float(),
+        k=k,
+        dim=-1
+    ).indices
+
+    t_ids = torch.topk(
+        teacher_logits.detach().float(),
+        k=k,
+        dim=-1
+    ).indices
+
+    if tokenizer_alignment is not None:
+        t_ids = map_teacher_topk_to_student(
+            t_ids,
+            tokenizer_alignment.teacher_to_student,
+        )
+
+    valid = t_ids.ge(0)
+
+    overlap = (
+        s_ids.unsqueeze(-1)
+        .eq(t_ids.unsqueeze(-2))
+        .any(-1)
+        .float()
+    )
+
+    overlap = overlap * valid.any(-1).float()
+
+    return overlap.mean(-1).masked_fill(~mask, 0)
 
 
 def _topk_overlap(student_logits, teacher_logits, mask, k):
@@ -223,7 +385,8 @@ def compute_adaptive_kl_loss(
     student_logits_raw,
     teacher_logits_raw,
     labels,
-    cfg:dict[str,Any]
+    cfg:dict[str,Any],
+    tokenizer_alignment=None,
 ):
 
     student_logits,_,mask = _shift_logits(
@@ -249,20 +412,42 @@ def compute_adaptive_kl_loss(
     )
 
 
-    reverse_loss=_reverse_kl_topk(
-        student_logits,
-        teacher_logits,
-        mask,
-        reverse_k
-    )
+    if tokenizer_alignment is not None:
 
-    forward_loss=_forward_kl_topk(
-        student_logits,
-        teacher_logits,
-        mask,
-        forward_k
-    )
+        reverse_loss = _cross_tokenizer_reverse_kl_topk(
+            student_logits,
+            teacher_logits,
+            mask,
+            k=reverse_k,
+            tokenizer_alignment=tokenizer_alignment,
+        )
 
+        forward_loss = _cross_tokenizer_forward_kl_topk(
+            student_logits,
+            teacher_logits,
+            mask,
+            k=forward_k,
+            tokenizer_alignment=tokenizer_alignment,
+        )
+
+    else:
+
+        reverse_loss = _reverse_kl_topk(
+            student_logits,
+            teacher_logits,
+            mask,
+            k=reverse_k,
+        )
+
+        forward_loss = _forward_kl_topk(
+            student_logits,
+            teacher_logits,
+            mask,
+            k=forward_k,
+        )
+
+
+    # 这里暂时还没做对齐，但是因为tokenizer基本相同，所以先不管
     overlap=_topk_overlap(
         student_logits,
         teacher_logits,
@@ -484,4 +669,53 @@ def compute_adaptive_kl_loss(
     return AdaptiveKLLossOutput(
         loss=final_loss,
         logs=logs
+    )
+
+
+
+def compute_cross_or_same_forward_kl(
+    student_logits,
+    teacher_logits,
+    mask,
+    k,
+    tokenizer_alignment=None,
+):
+    if _use_cross_tokenizer(tokenizer_alignment):
+        return _cross_tokenizer_forward_kl_topk(
+            student_logits,
+            teacher_logits,
+            mask,
+            k,
+            tokenizer_alignment,
+        )
+
+    return _forward_kl_topk(
+        student_logits,
+        teacher_logits,
+        mask,
+        k,
+    )
+
+
+def compute_cross_or_same_reverse_kl(
+    student_logits,
+    teacher_logits,
+    mask,
+    k,
+    tokenizer_alignment=None,
+):
+    if _use_cross_tokenizer(tokenizer_alignment):
+        return _cross_tokenizer_reverse_kl_topk(
+            student_logits,
+            teacher_logits,
+            mask,
+            k,
+            tokenizer_alignment,
+        )
+
+    return _reverse_kl_topk(
+        student_logits,
+        teacher_logits,
+        mask,
+        k,
     )
