@@ -7,7 +7,7 @@ loss_backend: sampled_rkl
 # high overlap -> reverse KL; medium overlap -> forward KL; very low overlap -> downweighted forward repair.
 adaptive_granularity: token
 adaptive_low_threshold: 0.0
-adaptive_high_threshold: 0.8
+adaptive_high_threshold: 0.65
 adaptive_low_action: downweight   # downweight | forward | reverse | skip
 adaptive_low_weight: 0.2
 adaptive_medium_weight: 1.0
@@ -16,4 +16,4 @@ reverse_top_k: 16
 forward_top_k: 64       # larger K for forward KL support repair
 overlap_top_k: 16
 kl_renorm_topk: true
-output_dir: outputs/qwen25_math_15b_to_qwen3_4b_adaptive_kl_token
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_adaptive_kl_token_threshold0.65

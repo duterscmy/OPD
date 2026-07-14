@@ -6,10 +6,10 @@ loss_backend: sampled_rkl
 kd_top_k: 16
 reverse_top_k: 16
 overlap_top_k: 16
-prune_overlap_threshold: 0.8
+prune_overlap_threshold: 0.65
 prune_w_drop: 0.01
 prune_w_base: 0.5
 prune_cumulative: true
 prune_base_loss: reverse_kl
 kl_renorm_topk: true
-output_dir: outputs/qwen25_math_15b_to_qwen3_4b_prune_opd_lite
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_prune_opd_lite_topk_threshold0.65
