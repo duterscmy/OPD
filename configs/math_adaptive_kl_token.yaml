@@ -16,4 +16,5 @@ reverse_top_k: 16
 forward_top_k: 64       # larger K for forward KL support repair
 overlap_top_k: 16
 kl_renorm_topk: true
+save_steps: 25
 output_dir: outputs/qwen25_math_15b_to_qwen3_4b_adaptive_kl_token_threshold0.65

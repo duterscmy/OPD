@@ -12,4 +12,5 @@ prune_w_base: 0.5
 prune_cumulative: true
 prune_base_loss: reverse_kl
 kl_renorm_topk: true
+save_steps: 25
 output_dir: outputs/qwen25_math_15b_to_qwen3_4b_prune_opd_lite_topk_threshold0.65

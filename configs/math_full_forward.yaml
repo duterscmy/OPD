@@ -3,4 +3,5 @@ strategy: full
 full_max_new_tokens: 1024
 loss_backend: sampled_rkl
 opd_loss_mode: forward_kl
+save_steps: 25
 output_dir: outputs/qwen25_math_15b_to_qwen3_4b_forward_Kl
