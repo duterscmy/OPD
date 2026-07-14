@@ -43,4 +43,4 @@ lm_eval \
   --gen_kwargs "$GEN_KWARGS" \
   --log_samples \
   --output_path "$OUTPUT_PATH" \
-  "${EXTRA[@]}" 2>&1 | tee "$OUTPUT_PATH/eval.$TASKS.num_fewshot$NUM_FEWSHOT.log"
+  "${EXTRA[@]}" 2>&1 | tee "$OUTPUT_PATH/eval.chat.$TASKS.num_fewshot$NUM_FEWSHOT.log"
