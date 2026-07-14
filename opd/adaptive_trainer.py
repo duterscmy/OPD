@@ -262,10 +262,19 @@ class AdaptiveKLTrainer(BaseAdaptiveOPDTrainer):
         # Adaptive KL / prune / top-k overlap path.
         # ---------------------------------------------------------------------
         if not self.same_tokenizer:
-            raise ValueError(
-                "Adaptive KL / top-k overlap losses require identical teacher/student tokenizers. "
-                "For cross-tokenizer pairs, either use loss_backend=sampled_rkl or choose models with shared vocab."
-            )
+
+            if not hasattr(self, "tokenizer_alignment"):
+                raise ValueError(
+                    "Tokenizer mismatch detected but tokenizer_alignment is missing."
+                )
+
+            if self.accelerator.is_main_process:
+                print(
+                    "[Tokenizer Alignment] "
+                    f"shared_ratio={self.tokenizer_alignment.shared_ratio:.4f}, "
+                    f"teacher_only={self.tokenizer_alignment.teacher_only}, "
+                    f"student_only={self.tokenizer_alignment.student_only}"
+                )
 
         self._print_debug_block(
             title="Entering adaptive KL loss path",
