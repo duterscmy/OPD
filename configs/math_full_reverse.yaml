@@ -7,4 +7,5 @@ kd_top_k: 16
 reverse_top_k: 16
 overlap_top_k: 16
 kl_renorm_topk: true
+save_steps: 25
 output_dir: outputs/qwen25_math_15b_to_qwen3_4b_full_reverse
