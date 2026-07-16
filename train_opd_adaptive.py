@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,62 @@ def load_config_with_base(config_path: str, overrides: list[str]) -> dict[str, A
 
     cfg["_cli_overrides"] = parsed_overrides
     return cfg
+
+
+
+def find_latest_checkpoint(output_dir: str) -> str | None:
+    """Automatically find the latest checkpoint-xxxx directory.
+
+    The checkpoint with the largest numerical suffix is selected.
+    Example:
+        checkpoint-100
+        checkpoint-200
+        checkpoint-500  -> selected
+    """
+    output_path = Path(output_dir)
+
+    if not output_path.exists():
+        return None
+
+    candidates = []
+    for p in output_path.glob("checkpoint-*"):
+        if not p.is_dir():
+            continue
+
+        match = re.match(r"checkpoint-(\d+)$", p.name)
+        if match:
+            candidates.append((int(match.group(1)), p))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    return str(candidates[-1][1])
+
+
+def resolve_resume_checkpoint(cfg: dict[str, Any], output_dir: Path) -> None:
+    """Resolve resume checkpoint automatically.
+
+    Priority:
+      1. Explicit cfg['resume_from_checkpoint']
+      2. Auto-detect largest checkpoint-* under output_dir
+      3. None (train from scratch)
+    """
+    explicit = cfg.get("resume_from_checkpoint")
+
+    if explicit:
+        cfg["resume_from_checkpoint_source"] = "config"
+        return
+
+    if bool(cfg.get("auto_resume", True)):
+        latest = find_latest_checkpoint(str(output_dir))
+        if latest is not None:
+            cfg["resume_from_checkpoint"] = latest
+            cfg["resume_from_checkpoint_source"] = "auto_detect"
+            return
+
+    cfg["resume_from_checkpoint"] = None
+    cfg["resume_from_checkpoint_source"] = "none"
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,6 +248,9 @@ def main() -> None:
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Automatically resume from the latest checkpoint-* if available.
+    resolve_resume_checkpoint(cfg, output_dir)
+
     # Save resolved config after CLI overrides and effective length inference.
     with (output_dir / "resolved_config.json").open("w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False, default=str)
@@ -208,10 +268,13 @@ def main() -> None:
             "loaded_base_config": cfg.get("_loaded_base_config"),
             "cli_overrides": cfg.get("_cli_overrides"),
             "output_dir": str(output_dir),
+            "latest_checkpoint_detected": cfg.get("resume_from_checkpoint"),
             "strategy": cfg.get("strategy"),
             "opd_loss_mode": cfg.get("opd_loss_mode", "original"),
             "seed": cfg.get("seed"),
             "resume_from_checkpoint": cfg.get("resume_from_checkpoint"),
+            "resume_from_checkpoint_source": cfg.get("resume_from_checkpoint_source"),
+            "auto_resume": cfg.get("auto_resume", True),
             "debug_train_log": cfg.get("debug_train_log"),
             "debug_train_log_steps": cfg.get("debug_train_log_steps"),
         },
@@ -575,6 +638,8 @@ def main() -> None:
             "total_elapsed_sec": round(total_elapsed, 3),
             "total_elapsed_min": round(total_elapsed / 60.0, 3),
             "resolved_config_path": str(output_dir / "resolved_config.json"),
+            "resume_from_checkpoint": cfg.get("resume_from_checkpoint"),
+            "resume_from_checkpoint_source": cfg.get("resume_from_checkpoint_source"),
         }, indent=2, ensure_ascii=False, default=str))
         print("=" * 100)
         print("", flush=True)

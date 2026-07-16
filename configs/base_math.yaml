@@ -91,6 +91,7 @@ num_workers: 0
 report_to: none
 save_only_model: false
 resume_from_checkpoint: null
+auto_resume: true
 
 use_lora: true
 lora_r: 32
