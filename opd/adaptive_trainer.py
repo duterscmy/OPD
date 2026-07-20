@@ -203,15 +203,30 @@ class AdaptiveKLTrainer(BaseAdaptiveOPDTrainer):
         # ---------------------------------------------------------------------
         # Original TRL/GKD/sample reverse KL path.
         # ---------------------------------------------------------------------
-        if mode in {"original", "trl_gjsd", "sampled_rkl"}:
+        # IMPORTANT:
+        # Some configs use opd_loss_mode=reverse_kl only as a human-readable
+        # experiment label, while loss_backend=sampled_rkl is the actual loss
+        # implementation to use. Therefore routing must prioritize
+        # self.loss_backend, not only opd_loss_mode. Otherwise ESR sampled_rkl
+        # with non-identical tokenizers accidentally enters the adaptive top-k
+        # KL path and fails because tokenizer_alignment is absent.
+        loss_backend = str(getattr(self, "loss_backend", self.experiment_config.get("loss_backend", "auto")))
+        delegate_to_base = (
+            loss_backend in {"sampled_rkl", "trl_gjsd"}
+            or mode in {"original", "trl_gjsd", "sampled_rkl"}
+        )
+
+        if delegate_to_base:
             self._print_debug_block(
                 title="Entering base OPD/GKD loss path",
                 payload={
                     **base_payload,
                     "path": "super.compute_loss",
+                    "routing/loss_backend": loss_backend,
+                    "routing/delegate_to_base": True,
                     "note": (
-                        "This path is delegated to BaseAdaptiveOPDTrainer. "
-                        "If it is slow, inspect rollout generation and teacher forward inside the base trainer."
+                        "This path is delegated to BaseAdaptiveOPDTrainer according to loss_backend. "
+                        "For loss_backend=sampled_rkl, non-identical tokenizers are allowed."
                     ),
                 },
             )
