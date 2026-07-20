@@ -73,12 +73,34 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "rollout_do_sample": True,
 
     # GKD / loss
-    "loss_backend": "auto",  # auto | trl_gjsd | sampled_rkl
+    # loss_backend:
+    #   auto         -> trl_gjsd if tokenizers match, otherwise sampled_rkl
+    #   trl_gjsd     -> original TRL GKD loss, requires same tokenizer
+    #   sampled_rkl  -> sampled reverse-KL-style loss for different tokenizers
+    #   adaptive_opd -> custom overlap-gated reverse + auxiliary forward KL, requires same tokenizer
+    "loss_backend": "auto",
     "lmbda": 1.0,
     "beta": 1.0,
     "seq_kd": False,
     "minimum_aligned_chars": 1,
     "rkl_advantage_clip": None,
+
+    # Adaptive OPD loss. Used only when loss_backend=adaptive_opd.
+    # Recommended first trial for your current results:
+    #   overlap >= adaptive_overlap_threshold: reverse KL
+    #   overlap <  adaptive_overlap_threshold: reverse KL + adaptive_forward_lambda * forward KL
+    "adaptive_overlap_threshold": 0.55,
+    "adaptive_overlap_low_threshold": 0.0,
+    "adaptive_use_low_band": False,
+    "adaptive_forward_lambda": 0.10,
+    "adaptive_low_forward_lambda": 0.05,
+    "adaptive_reverse_top_k": 16,
+    "adaptive_forward_top_k": 16,
+    "adaptive_overlap_top_k": 16,
+    "adaptive_reverse_weight": 1.0,
+    "adaptive_forward_weight": 1.0,
+    "adaptive_loss_eps": 1.0e-8,
+    "adaptive_log_prefix": "adaptive_loss/opd",
 
     # Training hyperparameters
     "output_dir": "outputs/qwen25_math_15b_to_qwen3_4b_esr100",

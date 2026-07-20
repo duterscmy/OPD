@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from transformers import Trainer
 from trl.experimental.gkd import GKDTrainer
 from trl.models.utils import unwrap_model_for_generation
 
 from .alignment import build_text_span_alignment
-from .tokenizer_alignment import build_tokenizer_alignment
 from .answers import judge_correctness
 from .collator import apply_chat_template_ids
 from .reflection import build_reflection_prompt, judge_batch, split_token_chunks
@@ -19,12 +19,44 @@ from .schedules import HorizonSchedule
 
 
 def _tokenizers_identical(a: Any, b: Any) -> bool:
+    """Strict tokenizer equality for full-vocabulary losses.
+
+    This is intentionally strict: full-vocab TRL GKD/JSD-style losses require
+    exactly the same token-id space.
+    """
     if len(a) != len(b):
         return False
     try:
         return a.get_vocab() == b.get_vocab()
     except Exception:
         return False
+
+
+def _tokenizers_prefix_compatible(student_tokenizer: Any, teacher_tokenizer: Any) -> bool:
+    """Allow teacher vocab to append extra tokens after the student vocab.
+
+    This matches the Qwen2.5/Qwen3-style case you described: the common token-id
+    prefix is shared, while the teacher may have a few additional special tokens
+    at the end.  Adaptive top-k overlap/KL can still be computed safely if we
+    restrict all distributions to the common student vocabulary.
+    """
+    try:
+        if len(teacher_tokenizer) < len(student_tokenizer):
+            return False
+        student_vocab = student_tokenizer.get_vocab()
+        teacher_vocab = teacher_tokenizer.get_vocab()
+        for token, student_id in student_vocab.items():
+            if teacher_vocab.get(token) != student_id:
+                return False
+        return True
+    except Exception:
+        # Conservative fallback: if vocab dictionaries are unavailable, only rely
+        # on lengths.  The adaptive loss will still restrict logits to the common
+        # prefix, but exact ID equality cannot be verified here.
+        try:
+            return len(teacher_tokenizer) >= len(student_tokenizer)
+        except Exception:
+            return False
 
 
 def _median(values: list[int]) -> float:
@@ -74,22 +106,8 @@ class AdaptiveOPDTrainer(GKDTrainer):
         )
 
         self.same_tokenizer = _tokenizers_identical(self.processing_class, teacher_tokenizer)
-
-        # New cross-tokenizer alignment support.
-        # Keep old behavior for identical tokenizers.
-        self.tokenizer_alignment = build_tokenizer_alignment(
-            self.processing_class,
-            teacher_tokenizer,
-        )
-
-        if self.accelerator.is_main_process:
-            print(
-                {
-                    "tokenizer_shared_ratio": self.tokenizer_alignment.shared_ratio,
-                    "teacher_only_tokens": self.tokenizer_alignment.teacher_only,
-                    "student_only_tokens": self.tokenizer_alignment.student_only,
-                }
-            )
+        self.prefix_compatible_tokenizer = _tokenizers_prefix_compatible(self.processing_class, teacher_tokenizer)
+        self.common_vocab_size = min(int(len(self.processing_class)), int(len(teacher_tokenizer)))
 
         requested = experiment_config.get("loss_backend", "auto")
         if requested == "auto":
@@ -100,6 +118,20 @@ class AdaptiveOPDTrainer(GKDTrainer):
             raise ValueError("TRL full-vocabulary GKD requires identical tokenizers. Use sampled_rkl.")
         if self.loss_backend == "sampled_rkl" and float(experiment_config["beta"]) != 1.0:
             raise ValueError("sampled_rkl implements sampled reverse KL and requires beta=1.0")
+        if self.loss_backend == "adaptive_opd":
+            allow_prefix_compatible = bool(experiment_config.get("adaptive_allow_prefix_vocab_compatible", True))
+            if not self.same_tokenizer:
+                if not allow_prefix_compatible or not self.prefix_compatible_tokenizer:
+                    raise ValueError(
+                        "adaptive_opd requires identical tokenizers or prefix-compatible tokenizers "
+                        "where the teacher only appends extra tokens after the student vocab. "
+                        "For cross-tokenizer teachers, switch loss_backend to sampled_rkl."
+                    )
+                self.accelerator.print(
+                    "[adaptive_opd] Student/teacher tokenizers are prefix-compatible but not identical. "
+                    f"Using common_vocab_size={self.common_vocab_size}; teacher-only extra tokens are masked out "
+                    "for overlap, reverse top-k KL, and forward top-k KL."
+                )
 
         self.minimum_aligned_chars = int(experiment_config.get("minimum_aligned_chars", 1))
         self.rkl_advantage_clip = experiment_config.get("rkl_advantage_clip")
@@ -452,6 +484,192 @@ class AdaptiveOPDTrainer(GKDTrainer):
         log_z = torch.logsumexp(shifted_logits.float(), dim=-1)
         return selected - log_z
 
+
+    @staticmethod
+    def _safe_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Mean over a boolean mask, preserving gradient when values require grad."""
+        denom = mask.float().sum().clamp_min(1.0)
+        return (values * mask.float()).sum() / denom
+
+    @staticmethod
+    def _topk_directional_kl(
+        source_logits: torch.Tensor,
+        target_logits: torch.Tensor,
+        top_k: int,
+    ) -> torch.Tensor:
+        """Approximate KL(source || target) on source top-k tokens.
+
+        Returns one KL value per position with shape [batch, seq_minus_1].
+        The distribution is renormalized inside the selected source top-k set.
+        This is intentionally a compact top-k approximation, not full-vocab KL.
+        """
+        vocab = source_logits.shape[-1]
+        k = max(1, min(int(top_k), int(vocab)))
+        src_top = torch.topk(source_logits.float(), k=k, dim=-1)
+        idx = src_top.indices
+        src_selected_logits = src_top.values
+        tgt_selected_logits = target_logits.float().gather(-1, idx)
+
+        src_logp = F.log_softmax(src_selected_logits, dim=-1)
+        tgt_logp = F.log_softmax(tgt_selected_logits, dim=-1)
+        src_p = src_logp.exp()
+        return (src_p * (src_logp - tgt_logp)).sum(dim=-1)
+
+    @staticmethod
+    def _topk_overlap(student_logits: torch.Tensor, teacher_logits: torch.Tensor, top_k: int) -> torch.Tensor:
+        """Top-k set overlap |TopK_s ∩ TopK_t| / k for every token position."""
+        vocab = student_logits.shape[-1]
+        k = max(1, min(int(top_k), int(vocab)))
+        s_idx = torch.topk(student_logits.float(), k=k, dim=-1).indices
+        t_idx = torch.topk(teacher_logits.float(), k=k, dim=-1).indices
+        # [B, T, k, k] equality matrix; k is small, normally 16.
+        matches = (s_idx.unsqueeze(-1) == t_idx.unsqueeze(-2)).any(dim=-1)
+        return matches.float().sum(dim=-1) / float(k)
+
+    @staticmethod
+    def _first_response_position(mask: torch.Tensor, active_mask: torch.Tensor) -> int:
+        """Return first 1-indexed generated-token position satisfying mask, or -1."""
+        if not bool(mask.any().item()):
+            return -1
+        response_positions = torch.cumsum(active_mask.long(), dim=1) - 1
+        selected = response_positions[mask]
+        if selected.numel() == 0:
+            return -1
+        return int(selected.min().detach().cpu().item()) + 1
+
+    def _adaptive_opd_loss(self, model: Any, inputs: dict[str, Any], return_outputs: bool):
+        """Overlap-gated OPD objective.
+
+        Current intended behavior:
+          - high overlap: reverse KL only
+          - mid/low overlap: reverse KL + lambda * forward KL
+
+        This keeps reverse KL as the on-policy backbone and uses forward KL only
+        as a weak auxiliary correction. Low band can be disabled; when disabled,
+        all below-threshold tokens are treated as mid.
+        """
+        student_outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], use_cache=False)
+        self.teacher_model.eval()
+        with torch.no_grad():
+            teacher_outputs = self.teacher_model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                use_cache=False,
+            )
+
+        # Token t is predicted by logits at position t-1.
+        student_logits = student_outputs.logits[:, :-1, :]
+        teacher_logits = teacher_outputs.logits[:, :-1, :]
+
+        # If the teacher has extra special tokens appended at the end of the vocab,
+        # mask them out by slicing both logits to the shared token-id prefix.
+        # This preserves compatibility with Qwen-style tokenizer pairs where
+        # token ids 0..len(student)-1 are shared and only teacher-only tokens are
+        # appended after that range.
+        common_vocab = min(
+            int(self.common_vocab_size),
+            int(student_logits.shape[-1]),
+            int(teacher_logits.shape[-1]),
+        )
+        student_logits_common = student_logits[..., :common_vocab]
+        teacher_logits_common = teacher_logits[..., :common_vocab]
+
+        shifted_labels = inputs["labels"][:, 1:]
+        shifted_attn = inputs["attention_mask"][:, 1:].bool()
+        active = (shifted_labels != -100) & shifted_attn
+
+        reverse_top_k = int(self.experiment_config.get("adaptive_reverse_top_k", 16))
+        forward_top_k = int(self.experiment_config.get("adaptive_forward_top_k", 16))
+        overlap_top_k = int(self.experiment_config.get("adaptive_overlap_top_k", 16))
+        eps = float(self.experiment_config.get("adaptive_loss_eps", 1.0e-8))
+
+        # reverse_loss approximates KL(student || teacher) on student top-k.
+        reverse_loss = self._topk_directional_kl(student_logits_common, teacher_logits_common, reverse_top_k)
+        # forward_loss approximates KL(teacher || student) on teacher top-k.
+        # Teacher-only extra special tokens are excluded by the common-vocab slice above.
+        forward_loss = self._topk_directional_kl(teacher_logits_common, student_logits_common, forward_top_k)
+        overlap = self._topk_overlap(student_logits_common, teacher_logits_common, overlap_top_k)
+
+        high_thr = float(self.experiment_config.get("adaptive_overlap_threshold", 0.55))
+        low_thr = float(self.experiment_config.get("adaptive_overlap_low_threshold", 0.0))
+        use_low = bool(self.experiment_config.get("adaptive_use_low_band", False))
+        mid_lambda = float(self.experiment_config.get("adaptive_forward_lambda", 0.10))
+        low_lambda = float(self.experiment_config.get("adaptive_low_forward_lambda", mid_lambda))
+        reverse_weight = float(self.experiment_config.get("adaptive_reverse_weight", 1.0))
+        forward_weight = float(self.experiment_config.get("adaptive_forward_weight", 1.0))
+
+        high_mask = active & (overlap >= high_thr)
+        if use_low:
+            low_mask = active & (overlap < low_thr)
+        else:
+            low_mask = torch.zeros_like(active, dtype=torch.bool)
+        mid_mask = active & (~high_mask) & (~low_mask)
+        forward_mask = mid_mask | low_mask
+
+        lambda_map = torch.zeros_like(reverse_loss, dtype=reverse_loss.dtype)
+        lambda_map = torch.where(mid_mask, torch.full_like(lambda_map, mid_lambda), lambda_map)
+        lambda_map = torch.where(low_mask, torch.full_like(lambda_map, low_lambda), lambda_map)
+
+        token_loss = reverse_weight * reverse_loss + forward_weight * lambda_map * forward_loss
+        loss = self._safe_mean(token_loss, active)
+
+        # Lightweight diagnostics. These mirror your existing logs and help check
+        # whether forward KL dominates despite a small trigger fraction.
+        with torch.no_grad():
+            prefix = str(self.experiment_config.get("adaptive_log_prefix", "adaptive_loss/opd"))
+            active_count = active.float().sum().clamp_min(1.0)
+            high_fraction = high_mask.float().sum() / active_count
+            mid_fraction = mid_mask.float().sum() / active_count
+            low_fraction = low_mask.float().sum() / active_count
+            mean_overlap = self._safe_mean(overlap.detach(), active)
+            mean_reverse = self._safe_mean(reverse_loss.detach(), active)
+            if bool(forward_mask.any().item()):
+                mean_forward = self._safe_mean(forward_loss.detach(), forward_mask)
+            else:
+                mean_forward = torch.zeros((), device=loss.device)
+            forward_reverse_ratio = mean_forward / (mean_reverse + eps)
+
+            # Position buckets over generated tokens, not prompt tokens.
+            response_pos = torch.cumsum(active.long(), dim=1) - 1
+            response_len = active.long().sum(dim=1).clamp_min(1).unsqueeze(1)
+            rel_pos = (response_pos.float() + 1.0) / response_len.float()
+            early_mask = active & (rel_pos <= (1.0 / 3.0))
+            middle_mask = active & (rel_pos > (1.0 / 3.0)) & (rel_pos <= (2.0 / 3.0))
+            late_mask = active & (rel_pos > (2.0 / 3.0))
+
+            ov = overlap.detach()[active]
+            if ov.numel() > 0:
+                q = torch.quantile(ov.float(), torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90], device=ov.device))
+                p10, p25, p50, p75, p90 = [float(x.detach().cpu().item()) for x in q]
+            else:
+                p10 = p25 = p50 = p75 = p90 = 0.0
+
+            self.log({
+                f"{prefix}/loss": float(loss.detach().cpu().item()),
+                f"{prefix}/mean_reverse_loss": float(mean_reverse.detach().cpu().item()),
+                f"{prefix}/mean_forward_loss": float(mean_forward.detach().cpu().item()),
+                f"{prefix}/forward_reverse_ratio": float(forward_reverse_ratio.detach().cpu().item()),
+                f"{prefix}/mean_overlap": float(mean_overlap.detach().cpu().item()),
+                f"{prefix}/adaptive_high_fraction": float(high_fraction.detach().cpu().item()),
+                f"{prefix}/adaptive_mid_fraction": float(mid_fraction.detach().cpu().item()),
+                f"{prefix}/adaptive_low_fraction": float(low_fraction.detach().cpu().item()),
+                f"{prefix}/first_forward_position": float(self._first_response_position(forward_mask, active)),
+                f"{prefix}/first_low_position": float(self._first_response_position(low_mask, active)),
+                f"{prefix}/overlap_early": float(self._safe_mean(overlap.detach(), early_mask).detach().cpu().item()),
+                f"{prefix}/overlap_middle": float(self._safe_mean(overlap.detach(), middle_mask).detach().cpu().item()),
+                f"{prefix}/overlap_late": float(self._safe_mean(overlap.detach(), late_mask).detach().cpu().item()),
+                f"{prefix}/overlap_p10": p10,
+                f"{prefix}/overlap_p25": p25,
+                f"{prefix}/overlap_p50": p50,
+                f"{prefix}/overlap_p75": p75,
+                f"{prefix}/overlap_p90": p90,
+                f"{prefix}/common_vocab_size": float(common_vocab),
+                f"{prefix}/student_vocab_size": float(student_logits.shape[-1]),
+                f"{prefix}/teacher_vocab_size": float(teacher_logits.shape[-1]),
+            })
+
+        return (loss, student_outputs) if return_outputs else loss
+
     def _sampled_rkl_loss(self, model: Any, inputs: dict[str, Any], return_outputs: bool):
         student_outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], use_cache=False)
         self.teacher_model.eval()
@@ -484,5 +702,7 @@ class AdaptiveOPDTrainer(GKDTrainer):
     def compute_loss(self, model: Any, inputs: dict[str, Any], return_outputs: bool = False, num_items_in_batch: int | None = None):
         if self.loss_backend == "sampled_rkl":
             return self._sampled_rkl_loss(model, inputs, return_outputs)
+        if self.loss_backend == "adaptive_opd":
+            return self._adaptive_opd_loss(model, inputs, return_outputs)
         clean = {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"], "labels": inputs["labels"]}
         return super().compute_loss(model, clean, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)

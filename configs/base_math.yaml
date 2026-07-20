@@ -58,7 +58,7 @@ rkl_advantage_clip: null
 # Adaptive / top-k loss defaults.
 opd_loss_mode: reverse_kl
 kd_top_k: 16
-forward_top_k: 64
+forward_top_k: 16
 reverse_top_k: 16
 overlap_top_k: 16
 kl_renorm_topk: true
@@ -72,7 +72,7 @@ adaptive_low_action: downweight
 adaptive_low_weight: 0.2
 adaptive_granularity: token
 adaptive_stage_size: 50
-adaptive_forward_top_k: 64
+adaptive_forward_top_k: 16
 adaptive_reverse_top_k: 16
 
 output_dir: outputs/qwen25_math_15b_to_qwen3_4b_base

@@ -5,7 +5,7 @@ opd_loss_mode: fixed_mixture
 loss_backend: sampled_rkl
 mixture_forward_alpha: 0.5   # loss = alpha * forward_KL + (1-alpha) * reverse_KL
 reverse_top_k: 16
-forward_top_k: 32
+forward_top_k: 16
 overlap_top_k: 16
 kl_renorm_topk: true
 save_steps: 25
