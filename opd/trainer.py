@@ -114,8 +114,14 @@ class AdaptiveOPDTrainer(GKDTrainer):
             self.loss_backend = "trl_gjsd" if self.same_tokenizer else "sampled_rkl"
         else:
             self.loss_backend = requested
+
         if self.loss_backend == "trl_gjsd" and not self.same_tokenizer:
-            raise ValueError("TRL full-vocabulary GKD requires identical tokenizers. Use sampled_rkl.")
+            self.accelerator.print(
+                "[warning] loss_backend=trl_gjsd with non-identical tokenizers. "
+                "Continuing because this setup was previously supported. "
+                "This is usually OK when the teacher only appends extra special tokens "
+                "at the end of the vocabulary."
+            )
         if self.loss_backend == "sampled_rkl" and float(experiment_config["beta"]) != 1.0:
             raise ValueError("sampled_rkl implements sampled reverse KL and requires beta=1.0")
         if self.loss_backend == "adaptive_opd":

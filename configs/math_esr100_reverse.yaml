@@ -2,7 +2,7 @@ base_config: configs/base_math.yaml
 strategy: esr
 prefix_length: 100
 opd_loss_mode: reverse_kl
-loss_backend: trl_gjsd
+loss_backend: sampled_rkl
 kd_top_k: 16
 reverse_top_k: 16
 overlap_top_k: 16
