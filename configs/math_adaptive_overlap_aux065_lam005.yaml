@@ -1,6 +1,7 @@
 # Wider trigger adaptive OPD; use as ablation only.
 #   overlap >= 0.65 : reverse KL
 #   overlap <  0.65 : reverse KL + 0.05 * forward KL
+base_config: configs/base_math.yaml
 strategy: full
 loss_backend: adaptive_opd
 output_dir: outputs/qwen25_math_15b_to_qwen3_4b_adaptive_aux065_lam005
