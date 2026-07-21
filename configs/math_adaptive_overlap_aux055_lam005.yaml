@@ -28,6 +28,8 @@ adaptive_reverse_weight: 1.0
 adaptive_forward_weight: 1.0
 adaptive_log_prefix: adaptive_loss/opd
 
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
 max_steps: 200
-save_steps: 50
+save_steps: 25
 logging_steps: 1
