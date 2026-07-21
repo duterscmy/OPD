@@ -7,7 +7,7 @@ kd_top_k: 16
 reverse_top_k: 16
 overlap_top_k: 16
 save_steps: 25
-max_steps: 150
+max_steps: 200
 kl_renorm_topk: true
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 16
