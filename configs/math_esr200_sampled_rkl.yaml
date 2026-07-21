@@ -1,0 +1,14 @@
+base_config: configs/base_math.yaml
+strategy: esr
+prefix_length: 200
+opd_loss_mode: reverse_kl
+loss_backend: sampled_rkl
+kd_top_k: 16
+reverse_top_k: 16
+overlap_top_k: 16
+save_steps: 25
+max_steps: 150
+kl_renorm_topk: true
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_esr200_sampled_rkl
