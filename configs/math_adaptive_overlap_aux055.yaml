@@ -1,17 +1,13 @@
-# Adaptive OPD: keep reverse KL as the backbone, add weak forward KL only below overlap threshold.
-# Intended variant after your current finding:
-#   overlap >= 0.55 : reverse KL
-#   overlap <  0.55 : reverse KL + 0.10 * forward KL
 base_config: configs/base_math.yaml
 strategy: full
 loss_backend: adaptive_opd
+opd_loss_mode: overlap_aux_kl
 output_dir: outputs/qwen25_math_15b_to_qwen3_4b_adaptive_aux055_lam010
 
 full_max_new_tokens: 1024
 max_length: 4096
 max_prompt_length: 2048
 
-# Student/teacher. Keep these as your current setting.
 model_name_or_path: Qwen/Qwen2.5-Math-1.5B
 teacher_model_name_or_path: Qwen/Qwen3-4B
 student_use_chat_template: false
@@ -19,7 +15,8 @@ student_enable_thinking: false
 teacher_use_chat_template: true
 teacher_enable_thinking: false
 
-# Adaptive loss settings.
+# Allow Qwen3 teacher to have a few extra trailing special tokens.
+adaptive_allow_prefix_vocab_compatible: true
 adaptive_overlap_threshold: 0.55
 adaptive_use_low_band: false
 adaptive_overlap_low_threshold: 0.0
@@ -30,11 +27,8 @@ adaptive_forward_top_k: 16
 adaptive_overlap_top_k: 16
 adaptive_reverse_weight: 1.0
 adaptive_forward_weight: 1.0
-per_device_train_batch_size: 1
-gradient_accumulation_steps: 4
 adaptive_log_prefix: adaptive_loss/opd
 
-# Training budget.
 max_steps: 200
-save_steps: 25
+save_steps: 50
 logging_steps: 1

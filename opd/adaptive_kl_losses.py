@@ -138,6 +138,25 @@ def _shift_logits(logits, labels):
     return logits, target, mask
 
 
+
+
+def _crop_to_common_vocab_if_needed(student_logits, teacher_logits):
+    """Crop logits to the shared prefix vocabulary when teacher only appends tokens.
+
+    This supports cases such as Qwen2.5 student + Qwen3 teacher where token ids
+    are identical for the common vocabulary and the teacher has a few additional
+    special tokens at the end.  Top-k overlap/KL must not see those teacher-only
+    trailing ids.
+    """
+    student_vocab = int(student_logits.shape[-1])
+    teacher_vocab = int(teacher_logits.shape[-1])
+    common_vocab = min(student_vocab, teacher_vocab)
+    cropped = student_vocab != teacher_vocab
+    if cropped:
+        student_logits = student_logits[..., :common_vocab]
+        teacher_logits = teacher_logits[..., :common_vocab]
+    return student_logits, teacher_logits, common_vocab, student_vocab, teacher_vocab, cropped
+
 def _selected_log_probs(logits, ids):
     selected = logits.gather(-1, ids)
     log_z = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
@@ -399,16 +418,36 @@ def compute_adaptive_kl_loss(
         labels
     )
 
+    # If tokenizers are prefix-compatible but not identical, no explicit
+    # tokenizer_alignment object is required.  We simply restrict both
+    # distributions to the common prefix vocabulary, thereby masking out
+    # teacher-only trailing special tokens.
+    common_vocab_size = None
+    raw_student_vocab_size = int(student_logits.shape[-1])
+    raw_teacher_vocab_size = int(teacher_logits.shape[-1])
+    vocab_was_cropped = False
+    if tokenizer_alignment is None:
+        (
+            student_logits,
+            teacher_logits,
+            common_vocab_size,
+            raw_student_vocab_size,
+            raw_teacher_vocab_size,
+            vocab_was_cropped,
+        ) = _crop_to_common_vocab_if_needed(student_logits, teacher_logits)
+    else:
+        common_vocab_size = min(raw_student_vocab_size, raw_teacher_vocab_size)
+
     reverse_k=int(
-        cfg.get("reverse_top_k",16)
+        cfg.get("adaptive_reverse_top_k", cfg.get("reverse_top_k",16))
     )
 
     forward_k=int(
-        cfg.get("forward_top_k",64)
+        cfg.get("adaptive_forward_top_k", cfg.get("forward_top_k",16))
     )
 
     overlap_k=int(
-        cfg.get("overlap_top_k",16)
+        cfg.get("adaptive_overlap_top_k", cfg.get("overlap_top_k",16))
     )
 
 
@@ -447,16 +486,28 @@ def compute_adaptive_kl_loss(
         )
 
 
-    # 这里暂时还没做对齐，但是因为tokenizer基本相同，所以先不管
-    overlap=_topk_overlap(
-        student_logits,
-        teacher_logits,
-        mask,
-        overlap_k
-    )
+    if tokenizer_alignment is not None:
+        overlap=_topk_overlap_aligned(
+            student_logits,
+            teacher_logits,
+            mask,
+            overlap_k,
+            tokenizer_alignment=tokenizer_alignment,
+        )
+    else:
+        overlap=_topk_overlap(
+            student_logits,
+            teacher_logits,
+            mask,
+            overlap_k
+        )
 
 
     logs={}
+    logs["opd/common_vocab_size"] = float(common_vocab_size)
+    logs["opd/student_vocab_size"] = float(raw_student_vocab_size)
+    logs["opd/teacher_vocab_size"] = float(raw_teacher_vocab_size)
+    logs["opd/vocab_was_cropped"] = float(vocab_was_cropped)
 
     _add_overlap_logs(
         logs,
@@ -575,8 +626,61 @@ def compute_adaptive_kl_loss(
         ]=_first_position(bad)
 
 
+    elif mode in {"overlap_aux_kl", "adaptive_overlap_aux", "adaptive_kl_aux"}:
+
+        threshold=float(
+            cfg.get(
+                "adaptive_overlap_threshold",
+                cfg.get("adaptive_high_threshold", 0.55),
+            )
+        )
+        use_low_band=bool(cfg.get("adaptive_use_low_band", False))
+        low_threshold=float(cfg.get("adaptive_overlap_low_threshold", 0.0))
+
+        high_mask=(overlap>=threshold)&mask
+
+        if use_low_band:
+            low_mask=(overlap<low_threshold)&mask
+            mid_mask=(overlap>=low_threshold)&(overlap<threshold)&mask
+        else:
+            low_mask=torch.zeros_like(mask, dtype=torch.bool)
+            mid_mask=(overlap<threshold)&mask
+
+        mid_lambda=float(cfg.get("adaptive_forward_lambda", 0.10))
+        low_lambda=float(cfg.get("adaptive_low_forward_lambda", mid_lambda))
+
+        # Keep reverse KL as the backbone on every valid token.
+        # Add forward KL only on below-threshold tokens as a weak auxiliary term.
+        loss=reverse_loss.clone()
+        loss = loss + mid_mask.float()*mid_lambda*forward_loss
+        loss = loss + low_mask.float()*low_lambda*forward_loss
+
+        logs["opd/adaptive_high_fraction"]=float(
+            _masked_mean(high_mask.float(), mask).cpu()
+        )
+        logs["opd/adaptive_mid_fraction"]=float(
+            _masked_mean(mid_mask.float(), mask).cpu()
+        )
+        logs["opd/adaptive_low_fraction"]=float(
+            _masked_mean(low_mask.float(), mask).cpu()
+        )
+        logs["opd/first_forward_position"]=_first_position(mid_mask|low_mask)
+        logs["opd/first_low_position"]=_first_position(low_mask)
+        logs["opd/adaptive_overlap_threshold"]=threshold
+        logs["opd/adaptive_forward_lambda"]=mid_lambda
+        logs["opd/adaptive_low_forward_lambda"]=low_lambda
+        logs["opd/effective_forward_reverse_ratio"]=float(
+            (mid_lambda*_masked_mean(forward_loss, mid_mask) / (_masked_mean(reverse_loss, mid_mask) + 1e-8))
+            .detach()
+            .cpu()
+        ) if mid_mask.any() else 0.0
+
+
     elif mode=="adaptive_kl":
 
+        # Legacy behavior kept for old experiments:
+        # high overlap -> reverse, mid overlap -> forward, low -> configured action.
+        # This is NOT the recommended auxiliary-forward variant.
         low=float(
             cfg.get(
                 "adaptive_low_threshold",

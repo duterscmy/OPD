@@ -203,14 +203,14 @@ class AdaptiveKLTrainer(BaseAdaptiveOPDTrainer):
         # ---------------------------------------------------------------------
         # Original TRL/GKD/sample reverse KL path.
         # ---------------------------------------------------------------------
-        # IMPORTANT:
-        # Some configs use opd_loss_mode=reverse_kl only as a human-readable
-        # experiment label, while loss_backend=sampled_rkl is the actual loss
-        # implementation to use. Therefore routing must prioritize
-        # self.loss_backend, not only opd_loss_mode. Otherwise ESR sampled_rkl
-        # with non-identical tokenizers accidentally enters the adaptive top-k
-        # KL path and fails because tokenizer_alignment is absent.
-        loss_backend = str(getattr(self, "loss_backend", self.experiment_config.get("loss_backend", "auto")))
+        # Route by the actual implementation backend first.
+        # `opd_loss_mode` is sometimes used as an experiment label, e.g.
+        # opd_loss_mode=reverse_kl while loss_backend=sampled_rkl for ESR.
+        # In that case we must delegate to the base sampled-RKL trainer and
+        # must NOT enter the adaptive top-k loss path.
+        loss_backend = str(
+            getattr(self, "loss_backend", self.experiment_config.get("loss_backend", "auto"))
+        )
         delegate_to_base = (
             loss_backend in {"sampled_rkl", "trl_gjsd"}
             or mode in {"original", "trl_gjsd", "sampled_rkl"}
@@ -222,11 +222,9 @@ class AdaptiveKLTrainer(BaseAdaptiveOPDTrainer):
                 payload={
                     **base_payload,
                     "path": "super.compute_loss",
-                    "routing/loss_backend": loss_backend,
-                    "routing/delegate_to_base": True,
                     "note": (
-                        "This path is delegated to BaseAdaptiveOPDTrainer according to loss_backend. "
-                        "For loss_backend=sampled_rkl, non-identical tokenizers are allowed."
+                        "This path is delegated to BaseAdaptiveOPDTrainer. "
+                        "If it is slow, inspect rollout generation and teacher forward inside the base trainer."
                     ),
                 },
             )
@@ -277,18 +275,38 @@ class AdaptiveKLTrainer(BaseAdaptiveOPDTrainer):
         # Adaptive KL / prune / top-k overlap path.
         # ---------------------------------------------------------------------
         if not self.same_tokenizer:
+            # Your Qwen2.5 student / Qwen3 teacher case is prefix-compatible:
+            # the teacher only appends a few special tokens at the end.  In that
+            # case we do NOT need a tokenizer_alignment file; the adaptive loss
+            # will crop both logits to the common prefix vocabulary.
+            has_alignment = hasattr(self, "tokenizer_alignment")
+            prefix_ok = bool(getattr(self, "prefix_compatible_tokenizer", False))
+            allow_prefix = bool(
+                self.experiment_config.get("adaptive_allow_prefix_vocab_compatible", True)
+            )
 
-            if not hasattr(self, "tokenizer_alignment"):
+            if has_alignment:
+                if self.accelerator.is_main_process:
+                    print(
+                        "[Tokenizer Alignment] "
+                        f"shared_ratio={self.tokenizer_alignment.shared_ratio:.4f}, "
+                        f"teacher_only={self.tokenizer_alignment.teacher_only}, "
+                        f"student_only={self.tokenizer_alignment.student_only}"
+                    )
+            elif allow_prefix and prefix_ok:
+                if self.accelerator.is_main_process:
+                    print(
+                        "[Adaptive OPD] Non-identical but prefix-compatible tokenizers detected. "
+                        f"common_vocab_size={getattr(self, 'common_vocab_size', 'unknown')}. "
+                        "No tokenizer_alignment file is needed; teacher-only trailing tokens are ignored."
+                    )
+            else:
                 raise ValueError(
-                    "Tokenizer mismatch detected but tokenizer_alignment is missing."
-                )
-
-            if self.accelerator.is_main_process:
-                print(
-                    "[Tokenizer Alignment] "
-                    f"shared_ratio={self.tokenizer_alignment.shared_ratio:.4f}, "
-                    f"teacher_only={self.tokenizer_alignment.teacher_only}, "
-                    f"student_only={self.tokenizer_alignment.student_only}"
+                    "Tokenizer mismatch detected. No tokenizer_alignment is available, and "
+                    "the tokenizers were not recognized as prefix-compatible. If the teacher "
+                    "only appends extra special tokens at the end, set "
+                    "adaptive_allow_prefix_vocab_compatible=true and make sure trainer.py "
+                    "computes prefix_compatible_tokenizer/common_vocab_size."
                 )
 
         self._print_debug_block(
