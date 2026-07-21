@@ -108,7 +108,7 @@ for MODEL in "${CHECKPOINTS[@]}"; do
     --model_args "pretrained=${BASE_MODEL},peft=${MODEL},trust_remote_code=True,dtype=bfloat16" \
     --tasks "$TASKS" \
     --device "$DEVICE" \
-    --batch_size "$BATCH_SIZE" \
+    --batch_size "auto" \
     --num_fewshot "$NUM_FEWSHOT" \
     --gen_kwargs "$GEN_KWARGS" \
     --log_samples \
