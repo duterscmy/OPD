@@ -2,7 +2,7 @@ base_config: configs/base_math.yaml
 strategy: full
 loss_backend: adaptive_opd
 opd_loss_mode: overlap_aux_kl
-output_dir: outputs/qwen25_math_15b_to_qwen3_4b_adaptive_aux055_lam010
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_adaptive_aux065_lam010
 
 full_max_new_tokens: 1024
 max_length: 4096

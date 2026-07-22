@@ -7,6 +7,6 @@ kd_top_k: 16
 reverse_top_k: 16
 overlap_top_k: 16
 save_steps: 25
-max_steps: 150
+max_steps: 200
 kl_renorm_topk: true
 output_dir: outputs/qwen25_math_15b_to_qwen3_4b_esr200_reverse_new_prompt
