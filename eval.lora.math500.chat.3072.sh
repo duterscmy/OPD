@@ -27,7 +27,7 @@ BASE_MODEL=${BASE_MODEL:-"/lus/lfs1aip2/projects/public/u6nc/mingyu/models/Qwen2
 LOG_ROOT="${MODEL%/*}/eval"
 CKPT_NAME=$(basename "$MODEL")
 OUTPUT_PATH="${LOG_ROOT}/${CKPT_NAME}"
-
+echo "Output path: $OUTPUT_PATH"
 
 mkdir -p "$OUTPUT_PATH"
 
