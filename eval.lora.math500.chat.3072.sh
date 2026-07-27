@@ -20,7 +20,7 @@ TASKS=${TASKS:-minerva_math500}
 DEVICE=${DEVICE:-cuda:0}
 BATCH_SIZE=${BATCH_SIZE:-4}
 NUM_FEWSHOT=${NUM_FEWSHOT:-0}
-GEN_KWARGS=${GEN_KWARGS:-"max_gen_toks=4086,temperature=0.0,do_sample=False"}
+GEN_KWARGS=${GEN_KWARGS:-"max_gen_toks=3072,temperature=0.0,do_sample=False"}
 APPLY_CHAT_TEMPLATE=${APPLY_CHAT_TEMPLATE:-1}
 OUTPUT_PATH=${OUTPUT_PATH:-eval_results/$(basename "$MODEL")}
 BASE_MODEL=${BASE_MODEL:-"/lus/lfs1aip2/projects/public/u6nc/mingyu/models/Qwen2.5-Math-1.5B"}
@@ -44,4 +44,4 @@ lm_eval \
   --gen_kwargs "$GEN_KWARGS" \
   --log_samples \
   --output_path "$OUTPUT_PATH" \
-  "${EXTRA[@]}" 2>&1 | tee "$OUTPUT_PATH/eval.chat.$TASKS.length4096.num_fewshot$NUM_FEWSHOT.log"
+  "${EXTRA[@]}" 2>&1 | tee "$OUTPUT_PATH/eval.chat.$TASKS.length3072.num_fewshot$NUM_FEWSHOT.log"
