@@ -22,8 +22,13 @@ BATCH_SIZE=${BATCH_SIZE:-4}
 NUM_FEWSHOT=${NUM_FEWSHOT:-0}
 GEN_KWARGS=${GEN_KWARGS:-"max_gen_toks=3072,temperature=0.0,do_sample=False"}
 APPLY_CHAT_TEMPLATE=${APPLY_CHAT_TEMPLATE:-1}
-OUTPUT_PATH=${OUTPUT_PATH:-eval_results/$(basename "$MODEL")}
 BASE_MODEL=${BASE_MODEL:-"/lus/lfs1aip2/projects/public/u6nc/mingyu/models/Qwen2.5-Math-1.5B"}
+
+LOG_ROOT="${MODEL%/*}/eval"
+CKPT_NAME=$(basename "$MODEL")
+OUTPUT_PATH="${LOG_ROOT}/${CKPT_NAME}"
+
+
 mkdir -p "$OUTPUT_PATH"
 
 EXTRA=()
