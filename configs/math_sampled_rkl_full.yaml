@@ -1,0 +1,5 @@
+base_config: base_math.yaml
+strategy: full
+loss_backend: sampled_rkl
+opd_loss_mode: sampled_rkl
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_sampled_rkl_full
