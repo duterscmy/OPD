@@ -1,825 +1,386 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 
-from .tokenizer_alignment import map_teacher_topk_to_student
 
-
-
-
-def _use_cross_tokenizer(tokenizer_alignment):
-    return (
-        tokenizer_alignment is not None
-        and hasattr(tokenizer_alignment, "teacher_to_student")
-        and hasattr(tokenizer_alignment, "student_to_teacher")
-    )
-
-
-def _map_ids(ids, mapping):
-    out = torch.full_like(ids, -1)
-    for src, dst in mapping.items():
-        out[ids == src] = dst
-    return out
-
-
-def _cross_tokenizer_forward_kl_topk(
-    student_logits,
-    teacher_logits,
-    mask,
-    k,
-    tokenizer_alignment,
-):
-    """Forward KL with teacher top-k projected to student vocabulary."""
-    k = min(k, teacher_logits.shape[-1])
-
-    with torch.no_grad():
-        teacher_ids = torch.topk(
-            teacher_logits.float(), k=k, dim=-1
-        ).indices
-
-        student_ids = _map_ids(
-            teacher_ids,
-            tokenizer_alignment.teacher_to_student,
-        )
-
-        valid = student_ids.ge(0)
-        student_ids = student_ids.clamp_min(0)
-
-        teacher_logp = _selected_log_probs(
-            teacher_logits,
-            teacher_ids,
-        )
-        teacher_prob = F.softmax(
-            teacher_logp,
-            dim=-1,
-        )
-
-    student_logp = _selected_log_probs(
-        student_logits,
-        student_ids,
-    )
-
-    loss = -(teacher_prob * student_logp).sum(-1)
-    loss = loss * valid.float().mean(-1)
-
-    return loss.masked_fill(~mask, 0)
-
-
-def _cross_tokenizer_reverse_kl_topk(
-    student_logits,
-    teacher_logits,
-    mask,
-    k,
-    tokenizer_alignment,
-):
-    """Reverse KL with student top-k projected to teacher vocabulary."""
-    k = min(k, student_logits.shape[-1])
-
-    student_ids = torch.topk(
-        student_logits.detach().float(),
-        k=k,
-        dim=-1,
-    ).indices
-
-    with torch.no_grad():
-        teacher_ids = _map_ids(
-            student_ids,
-            tokenizer_alignment.student_to_teacher,
-        )
-
-        valid = teacher_ids.ge(0)
-        teacher_ids = teacher_ids.clamp_min(0)
-
-        teacher_logp = _selected_log_probs(
-            teacher_logits,
-            teacher_ids,
-        )
-
-    student_logp = _selected_log_probs(
-        student_logits,
-        student_ids,
-    )
-
-    student_logp = F.log_softmax(student_logp, dim=-1)
-    teacher_logp = F.log_softmax(teacher_logp, dim=-1)
-
-    student_prob = student_logp.exp()
-
-    loss = (
-        student_prob *
-        (student_logp - teacher_logp)
-    ).sum(-1)
-
-    loss = loss * valid.float().mean(-1)
-
-    return loss.masked_fill(~mask, 0)
+ROUTE_NAMES = {
+    0: "inactive",
+    1: "reverse",
+    2: "forward",
+    3: "reverse+forward",
+    4: "reverse_pruned",
+    5: "pruned_reverse+forward",
+}
 
 
 @dataclass
-class AdaptiveKLLossOutput:
+class TopKOPDLossOutput:
     loss: torch.Tensor
-    logs: Dict[str, float]
+    logs: dict[str, float]
+    diagnostics: dict[str, torch.Tensor]
 
 
-def _masked_mean(x, mask):
-    denom = mask.float().sum().clamp_min(1.0)
-    return (x * mask.float()).sum() / denom
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return (values * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
 
 
-def _shift_logits(logits, labels):
-    logits = logits[:, :-1, :]
-    target = labels[:, 1:].clamp_min(0)
-    mask = labels[:, 1:].ne(-100)
-    return logits, target, mask
+def _masked_quantile(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    quantile: float,
+) -> float:
+    selected = values.detach().float()[mask]
+    if selected.numel() == 0:
+        return 0.0
+    return float(torch.quantile(selected, quantile).cpu().item())
 
 
+def _masked_correlation(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    mask: torch.Tensor,
+) -> float:
+    x = left.detach().float()[mask]
+    y = right.detach().float()[mask]
+    if x.numel() < 2:
+        return 0.0
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = x.square().sum().sqrt() * y.square().sum().sqrt()
+    if float(denom.cpu().item()) <= 1.0e-12:
+        return 0.0
+    return float(((x * y).sum() / denom).cpu().item())
 
 
-def _crop_to_common_vocab_if_needed(student_logits, teacher_logits):
-    """Crop logits to the shared prefix vocabulary when teacher only appends tokens.
-
-    This supports cases such as Qwen2.5 student + Qwen3 teacher where token ids
-    are identical for the common vocabulary and the teacher has a few additional
-    special tokens at the end.  Top-k overlap/KL must not see those teacher-only
-    trailing ids.
-    """
+def _crop_common_vocab(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
     student_vocab = int(student_logits.shape[-1])
     teacher_vocab = int(teacher_logits.shape[-1])
     common_vocab = min(student_vocab, teacher_vocab)
-    cropped = student_vocab != teacher_vocab
-    if cropped:
-        student_logits = student_logits[..., :common_vocab]
-        teacher_logits = teacher_logits[..., :common_vocab]
-    return student_logits, teacher_logits, common_vocab, student_vocab, teacher_vocab, cropped
-
-def _selected_log_probs(logits, ids):
-    selected = logits.gather(-1, ids)
-    log_z = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
-    return selected.float() - log_z
-
-
-def _forward_kl_topk(student_logits, teacher_logits, mask, k):
-    k = min(k, teacher_logits.shape[-1])
-
-    with torch.no_grad():
-        teacher_ids = torch.topk(
-            teacher_logits.float(),
-            k=k,
-            dim=-1
-        ).indices
-
-        teacher_logp = _selected_log_probs(
-            teacher_logits,
-            teacher_ids
-        )
-
-        teacher_prob = F.softmax(
-            teacher_logp,
-            dim=-1
-        )
-
-    student_logp = _selected_log_probs(
-        student_logits,
-        teacher_ids
+    return (
+        student_logits[..., :common_vocab],
+        teacher_logits[..., :common_vocab],
+        common_vocab,
+        student_vocab,
+        teacher_vocab,
     )
 
-    loss = -(teacher_prob * student_logp).sum(-1)
 
-    return loss.masked_fill(~mask, 0)
+def _topk(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    k = max(1, min(int(k), int(logits.shape[-1])))
+    result = torch.topk(logits.float(), k=k, dim=-1)
+    return result.indices, result.values
 
 
-def _reverse_kl_topk(student_logits, teacher_logits, mask, k):
-
-    k = min(k, student_logits.shape[-1])
-
-    student_ids = torch.topk(
-        student_logits.detach().float(),
-        k=k,
-        dim=-1
-    ).indices
-
-    student_logp = _selected_log_probs(
-        student_logits,
-        student_ids
-    )
-
-    with torch.no_grad():
-        teacher_logp = _selected_log_probs(
-            teacher_logits,
-            student_ids
-        )
-
-    student_logp = F.log_softmax(
-        student_logp,
-        dim=-1
-    )
-
+def _truncated_reverse_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """KL(student || teacher) on Student Top-K, renormalizing both sides."""
+    ids, student_values = _topk(student_logits.detach(), k)
+    # Re-gather from the non-detached tensor so student gradients are preserved.
+    student_values = student_logits.float().gather(-1, ids)
+    teacher_values = teacher_logits.float().gather(-1, ids)
+    student_logp = F.log_softmax(student_values, dim=-1)
+    teacher_logp = F.log_softmax(teacher_values, dim=-1)
     student_prob = student_logp.exp()
-
-    teacher_logp = F.log_softmax(
-        teacher_logp,
-        dim=-1
-    )
-
-    loss = (
-        student_prob *
-        (student_logp - teacher_logp)
-    ).sum(-1)
-
-    return loss.masked_fill(~mask, 0)
+    loss = (student_prob * (student_logp - teacher_logp)).sum(dim=-1)
+    return loss, ids, student_prob
 
 
+def _truncated_forward_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """KL(teacher || student) on Teacher Top-K, renormalizing both sides."""
+    ids, teacher_values = _topk(teacher_logits.detach(), k)
+    teacher_values = teacher_logits.float().gather(-1, ids)
+    student_values = student_logits.float().gather(-1, ids)
+    teacher_logp = F.log_softmax(teacher_values, dim=-1)
+    student_logp = F.log_softmax(student_values, dim=-1)
+    teacher_prob = teacher_logp.exp()
+    loss = (teacher_prob * (teacher_logp - student_logp)).sum(dim=-1)
+    return loss, ids, teacher_prob
 
 
-def _topk_overlap_aligned(
-    student_logits,
-    teacher_logits,
-    mask,
-    k,
-    tokenizer_alignment=None,
-):
-    """
-    Cross-tokenizer top-k overlap.
-
-    Teacher top-k token ids are mapped into student vocabulary
-    before computing overlap.
-    """
-
-    k = min(k, student_logits.shape[-1])
-
-    s_ids = torch.topk(
-        student_logits.detach().float(),
-        k=k,
-        dim=-1
-    ).indices
-
-    t_ids = torch.topk(
-        teacher_logits.detach().float(),
-        k=k,
-        dim=-1
-    ).indices
-
-    if tokenizer_alignment is not None:
-        t_ids = map_teacher_topk_to_student(
-            t_ids,
-            tokenizer_alignment.teacher_to_student,
-        )
-
-    valid = t_ids.ge(0)
-
-    overlap = (
-        s_ids.unsqueeze(-1)
-        .eq(t_ids.unsqueeze(-2))
-        .any(-1)
-        .float()
-    )
-
-    overlap = overlap * valid.any(-1).float()
-
-    return overlap.mean(-1).masked_fill(~mask, 0)
+def _topk_overlap(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    student_ids, _ = _topk(student_logits.detach(), k)
+    teacher_ids, _ = _topk(teacher_logits.detach(), k)
+    matches = student_ids.unsqueeze(-1).eq(teacher_ids.unsqueeze(-2)).any(dim=-1)
+    overlap = matches.float().sum(dim=-1) / float(student_ids.shape[-1])
+    return overlap, student_ids, teacher_ids
 
 
-def _topk_overlap(student_logits, teacher_logits, mask, k):
-
-    k = min(k, student_logits.shape[-1])
-
-    s_ids = torch.topk(
-        student_logits.detach().float(),
-        k=k,
-        dim=-1
-    ).indices
-
-    t_ids = torch.topk(
-        teacher_logits.detach().float(),
-        k=k,
-        dim=-1
-    ).indices
-
-    overlap = (
-        s_ids.unsqueeze(-1)
-        .eq(t_ids.unsqueeze(-2))
-        .any(-1)
-        .float()
-        .mean(-1)
-    )
-
-    return overlap.masked_fill(~mask, 0)
+def _prune_weights(
+    overlap: torch.Tensor,
+    active: torch.Tensor,
+    cfg: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    threshold = float(cfg.get("prune_overlap_threshold", 0.65))
+    bad = active & (overlap < threshold)
+    base = float(cfg.get("prune_w_base", 0.5))
+    cumulative = bool(cfg.get("prune_cumulative", True))
+    if cumulative:
+        drop = float(cfg.get("prune_w_drop", 0.01))
+        bad_count = torch.cumsum(bad.float(), dim=1)
+        weights = torch.clamp(1.0 - drop * bad_count, min=base, max=1.0)
+    else:
+        bad_count = bad.float()
+        weights = torch.where(bad, torch.full_like(overlap, base), torch.ones_like(overlap))
+    weights = torch.where(active, weights, torch.zeros_like(weights))
+    return weights, bad, bad_count
 
 
-def _add_overlap_logs(logs, overlap, mask):
+def _first_response_position(mask: torch.Tensor, active: torch.Tensor) -> float:
+    if not bool(mask.any().item()):
+        return -1.0
+    response_pos = torch.cumsum(active.long(), dim=1) - 1
+    return float(response_pos[mask].min().detach().cpu().item() + 1)
 
-    valid = overlap[mask]
 
-    if valid.numel() == 0:
-        return
-
-    logs["opd/mean_overlap"] = float(
-        valid.mean().detach().cpu()
-    )
-
-    for q in [0.1,0.25,0.5,0.75,0.9]:
-        logs[
-            f"opd/overlap_p{int(q*100)}"
-        ] = float(
-            torch.quantile(valid,q)
-            .detach()
-            .cpu()
-        )
-
-    for p in [
-        0,64,128,256,
-        512,768,1023
-    ]:
-        if p < overlap.shape[1]:
-            if mask[:,p].any():
-                logs[
-                    f"opd/overlap_pos_{p}"
-                ] = float(
-                    overlap[:,p][mask[:,p]]
-                    .mean()
-                    .detach()
-                    .cpu()
-                )
-
+def _add_region_logs(
+    logs: dict[str, float],
+    name: str,
+    values: torch.Tensor,
+    active: torch.Tensor,
+) -> None:
+    response_pos = torch.cumsum(active.long(), dim=1) - 1
+    response_len = active.long().sum(dim=1).clamp_min(1).unsqueeze(1)
+    relative = (response_pos.float() + 1.0) / response_len.float()
     regions = {
-        "early":(0,256),
-        "middle":(256,768),
-        "late":(768,overlap.shape[1])
+        "early": active & (relative <= 1.0 / 3.0),
+        "middle": active & (relative > 1.0 / 3.0) & (relative <= 2.0 / 3.0),
+        "late": active & (relative > 2.0 / 3.0),
+    }
+    for region, region_mask in regions.items():
+        logs[f"opd/{name}_{region}"] = float(
+            _masked_mean(values.detach(), region_mask).cpu().item()
+        )
+
+
+def _full_distribution_debug(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+    student_topk_ids: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Extra probability diagnostics, computed only when detailed logging is due."""
+    student_log_z = torch.logsumexp(student_logits.float(), dim=-1, keepdim=True)
+    teacher_log_z = torch.logsumexp(teacher_logits.float(), dim=-1, keepdim=True)
+    student_topk_full_prob = (
+        student_logits.float().gather(-1, student_topk_ids) - student_log_z
+    ).exp()
+    teacher_topk_full_prob = (
+        teacher_logits.float().gather(-1, teacher_topk_ids) - teacher_log_z
+    ).exp()
+    targets = labels[:, 1:].clamp_min(0).unsqueeze(-1)
+    student_target_logp = (
+        student_logits.float().gather(-1, targets) - student_log_z
+    ).squeeze(-1)
+    teacher_target_logp = (
+        teacher_logits.float().gather(-1, targets) - teacher_log_z
+    ).squeeze(-1)
+    return {
+        "student_topk_full_prob": student_topk_full_prob,
+        "teacher_topk_full_prob": teacher_topk_full_prob,
+        "student_topk_mass": student_topk_full_prob.sum(dim=-1),
+        "teacher_topk_mass": teacher_topk_full_prob.sum(dim=-1),
+        "student_target_logp": student_target_logp,
+        "teacher_target_logp": teacher_target_logp,
     }
 
-    for name,(s,e) in regions.items():
 
-        if s >= overlap.shape[1]:
-            continue
-
-        e=min(e,overlap.shape[1])
-
-        m=mask[:,s:e]
-
-        if m.any():
-            logs[
-                f"opd/overlap_{name}"
-            ] = float(
-                overlap[:,s:e][m]
-                .mean()
-                .detach()
-                .cpu()
-            )
-
-
-def _add_kl_logs(logs, fwd, rev, mask):
-
-    f=_masked_mean(fwd,mask)
-    r=_masked_mean(rev,mask)
-
-    logs["opd/mean_forward_loss"]=float(
-        f.detach().cpu()
-    )
-
-    logs["opd/mean_reverse_loss"]=float(
-        r.detach().cpu()
-    )
-
-    logs["opd/forward_reverse_ratio"]=float(
-        (f/(r+1e-8)).detach().cpu()
-    )
-
-
-def _first_position(mask):
-
-    idx=torch.where(mask)
-
-    if len(idx[0])==0:
-        return -1
-
-    return int(idx[1].min().cpu())
-
-
-def compute_adaptive_kl_loss(
-    student_logits_raw,
-    teacher_logits_raw,
-    labels,
-    cfg:dict[str,Any],
-    tokenizer_alignment=None,
-):
-
-    student_logits,_,mask = _shift_logits(
-        student_logits_raw,
-        labels
-    )
-
-    teacher_logits,_,_ = _shift_logits(
-        teacher_logits_raw,
-        labels
-    )
-
-    # If tokenizers are prefix-compatible but not identical, no explicit
-    # tokenizer_alignment object is required.  We simply restrict both
-    # distributions to the common prefix vocabulary, thereby masking out
-    # teacher-only trailing special tokens.
-    common_vocab_size = None
-    raw_student_vocab_size = int(student_logits.shape[-1])
-    raw_teacher_vocab_size = int(teacher_logits.shape[-1])
-    vocab_was_cropped = False
-    if tokenizer_alignment is None:
-        (
-            student_logits,
-            teacher_logits,
-            common_vocab_size,
-            raw_student_vocab_size,
-            raw_teacher_vocab_size,
-            vocab_was_cropped,
-        ) = _crop_to_common_vocab_if_needed(student_logits, teacher_logits)
-    else:
-        common_vocab_size = min(raw_student_vocab_size, raw_teacher_vocab_size)
-
-    reverse_k=int(
-        cfg.get("adaptive_reverse_top_k", cfg.get("reverse_top_k",16))
-    )
-
-    forward_k=int(
-        cfg.get("adaptive_forward_top_k", cfg.get("forward_top_k",16))
-    )
-
-    overlap_k=int(
-        cfg.get("adaptive_overlap_top_k", cfg.get("overlap_top_k",16))
-    )
-
-
-    if tokenizer_alignment is not None:
-
-        reverse_loss = _cross_tokenizer_reverse_kl_topk(
-            student_logits,
-            teacher_logits,
-            mask,
-            k=reverse_k,
-            tokenizer_alignment=tokenizer_alignment,
-        )
-
-        forward_loss = _cross_tokenizer_forward_kl_topk(
-            student_logits,
-            teacher_logits,
-            mask,
-            k=forward_k,
-            tokenizer_alignment=tokenizer_alignment,
-        )
-
-    else:
-
-        reverse_loss = _reverse_kl_topk(
-            student_logits,
-            teacher_logits,
-            mask,
-            k=reverse_k,
-        )
-
-        forward_loss = _forward_kl_topk(
-            student_logits,
-            teacher_logits,
-            mask,
-            k=forward_k,
-        )
-
-
-    if tokenizer_alignment is not None:
-        overlap=_topk_overlap_aligned(
-            student_logits,
-            teacher_logits,
-            mask,
-            overlap_k,
-            tokenizer_alignment=tokenizer_alignment,
-        )
-    else:
-        overlap=_topk_overlap(
-            student_logits,
-            teacher_logits,
-            mask,
-            overlap_k
-        )
-
-
-    logs={}
-    logs["opd/common_vocab_size"] = float(common_vocab_size)
-    logs["opd/student_vocab_size"] = float(raw_student_vocab_size)
-    logs["opd/teacher_vocab_size"] = float(raw_teacher_vocab_size)
-    logs["opd/vocab_was_cropped"] = float(vocab_was_cropped)
-
-    _add_overlap_logs(
-        logs,
-        overlap.detach(),
-        mask
-    )
-
-    _add_kl_logs(
-        logs,
-        forward_loss.detach(),
-        reverse_loss.detach(),
-        mask
-    )
-
-
-    mode=cfg.get(
-        "opd_loss_mode",
-        "reverse_kl"
-    )
-
-
-    if mode=="reverse_kl":
-
-        loss=reverse_loss
-
-        logs["opd/reverse_fraction"]=1.0
-        logs["opd/forward_fraction"]=0.0
-
-
-    elif mode=="forward_kl":
-
-        loss=forward_loss
-
-        logs["opd/reverse_fraction"]=0.0
-        logs["opd/forward_fraction"]=1.0
-
-
-    elif mode=="fixed_mixture":
-
-        alpha=float(
-            cfg.get(
-                "mixture_forward_alpha",
-                0.5
-            )
-        )
-
-        loss=(
-            alpha*forward_loss+
-            (1-alpha)*reverse_loss
-        )
-
-        logs[
-            "opd/mixture_forward_alpha"
-        ]=alpha
-
-        logs["opd/forward_fraction"]=alpha
-        logs["opd/reverse_fraction"]=1-alpha
-
-
-    elif mode=="prune_opd_lite":
-
-        threshold=float(
-            cfg.get(
-                "prune_overlap_threshold",
-                0.7
-            )
-        )
-
-        w_drop=float(
-            cfg.get(
-                "prune_w_drop",
-                0.01
-            )
-        )
-
-        w_base=float(
-            cfg.get(
-                "prune_w_base",
-                0.5
-            )
-        )
-
-        bad=(overlap<threshold)&mask
-
-        weights=torch.clamp(
-            1-w_drop*torch.cumsum(
-                bad.float(),
-                dim=1
-            ),
-            min=w_base,
-            max=1
-        )
-
-        loss=weights*reverse_loss
-
-        logs[
-            "opd/prune_bad_fraction"
-        ]=float(
-            _masked_mean(
-                bad.float(),
-                mask
-            ).cpu()
-        )
-
-        logs[
-            "opd/prune_mean_weight"
-        ]=float(
-            _masked_mean(
-                weights,
-                mask
-            ).cpu()
-        )
-
-        logs[
-            "opd/first_prune_position"
-        ]=_first_position(bad)
-
-
-    elif mode in {"overlap_aux_kl", "adaptive_overlap_aux", "adaptive_kl_aux"}:
-
-        threshold=float(
-            cfg.get(
-                "adaptive_overlap_threshold",
-                cfg.get("adaptive_high_threshold", 0.55),
-            )
-        )
-        use_low_band=bool(cfg.get("adaptive_use_low_band", False))
-        low_threshold=float(cfg.get("adaptive_overlap_low_threshold", 0.0))
-
-        high_mask=(overlap>=threshold)&mask
-
-        if use_low_band:
-            low_mask=(overlap<low_threshold)&mask
-            mid_mask=(overlap>=low_threshold)&(overlap<threshold)&mask
-        else:
-            low_mask=torch.zeros_like(mask, dtype=torch.bool)
-            mid_mask=(overlap<threshold)&mask
-
-        mid_lambda=float(cfg.get("adaptive_forward_lambda", 0.10))
-        low_lambda=float(cfg.get("adaptive_low_forward_lambda", mid_lambda))
-
-        # Keep reverse KL as the backbone on every valid token.
-        # Add forward KL only on below-threshold tokens as a weak auxiliary term.
-        loss=reverse_loss.clone()
-        loss = loss + mid_mask.float()*mid_lambda*forward_loss
-        loss = loss + low_mask.float()*low_lambda*forward_loss
-
-        logs["opd/adaptive_high_fraction"]=float(
-            _masked_mean(high_mask.float(), mask).cpu()
-        )
-        logs["opd/adaptive_mid_fraction"]=float(
-            _masked_mean(mid_mask.float(), mask).cpu()
-        )
-        logs["opd/adaptive_low_fraction"]=float(
-            _masked_mean(low_mask.float(), mask).cpu()
-        )
-        logs["opd/first_forward_position"]=_first_position(mid_mask|low_mask)
-        logs["opd/first_low_position"]=_first_position(low_mask)
-        logs["opd/adaptive_overlap_threshold"]=threshold
-        logs["opd/adaptive_forward_lambda"]=mid_lambda
-        logs["opd/adaptive_low_forward_lambda"]=low_lambda
-        logs["opd/effective_forward_reverse_ratio"]=float(
-            (mid_lambda*_masked_mean(forward_loss, mid_mask) / (_masked_mean(reverse_loss, mid_mask) + 1e-8))
-            .detach()
-            .cpu()
-        ) if mid_mask.any() else 0.0
-
-
-    elif mode=="adaptive_kl":
-
-        # Legacy behavior kept for old experiments:
-        # high overlap -> reverse, mid overlap -> forward, low -> configured action.
-        # This is NOT the recommended auxiliary-forward variant.
-        low=float(
-            cfg.get(
-                "adaptive_low_threshold",
-                0.3
-            )
-        )
-
-        high=float(
-            cfg.get(
-                "adaptive_high_threshold",
-                0.7
-            )
-        )
-
-        high_mask=(overlap>=high)&mask
-        mid_mask=(
-            (overlap>=low)&
-            (overlap<high)&
-            mask
-        )
-
-        low_mask=(overlap<low)&mask
-
-        loss=(
-            high_mask.float()*reverse_loss+
-            mid_mask.float()*forward_loss
-        )
-
-        low_action=cfg.get(
-            "adaptive_low_action",
-            "downweight"
-        )
-
-        if low_action=="forward":
-            loss += low_mask.float()*forward_loss
-
-        elif low_action=="reverse":
-            loss += low_mask.float()*reverse_loss
-
-        elif low_action=="downweight":
-            loss += (
-                low_mask.float()*
-                float(cfg.get(
-                    "adaptive_low_weight",
-                    0.2
-                ))*
-                forward_loss
-            )
-
-        logs["opd/adaptive_high_fraction"]=float(
-            _masked_mean(
-                high_mask.float(),
-                mask
-            ).cpu()
-        )
-
-        logs["opd/adaptive_mid_fraction"]=float(
-            _masked_mean(
-                mid_mask.float(),
-                mask
-            ).cpu()
-        )
-
-        logs["opd/adaptive_low_fraction"]=float(
-            _masked_mean(
-                low_mask.float(),
-                mask
-            ).cpu()
-        )
-
-        logs["opd/first_forward_position"]=_first_position(mid_mask)
-        logs["opd/first_low_position"]=_first_position(low_mask)
-
-
-    else:
-        raise ValueError(
-            f"Unknown mode {mode}"
-        )
-
-
-    final_loss=_masked_mean(
-        loss,
-        mask
-    )
-
-    logs["opd/loss"]=float(
-        final_loss.detach().cpu()
-    )
-
-    return AdaptiveKLLossOutput(
-        loss=final_loss,
-        logs=logs
-    )
-
-
-
-def compute_cross_or_same_forward_kl(
-    student_logits,
-    teacher_logits,
-    mask,
-    k,
-    tokenizer_alignment=None,
-):
-    if _use_cross_tokenizer(tokenizer_alignment):
-        return _cross_tokenizer_forward_kl_topk(
-            student_logits,
-            teacher_logits,
-            mask,
-            k,
-            tokenizer_alignment,
-        )
-
-    return _forward_kl_topk(
+def compute_topk_opd_loss(
+    student_logits_raw: torch.Tensor,
+    teacher_logits_raw: torch.Tensor,
+    labels: torch.Tensor,
+    cfg: dict[str, Any],
+    collect_diagnostics: bool = False,
+) -> TopKOPDLossOutput:
+    """Compute all Top-K OPD variants through one explicit, testable route."""
+    student_logits = student_logits_raw[:, :-1, :]
+    teacher_logits = teacher_logits_raw[:, :-1, :]
+    active = labels[:, 1:].ne(-100)
+    (
         student_logits,
         teacher_logits,
-        mask,
-        k,
+        common_vocab,
+        student_vocab,
+        teacher_vocab,
+    ) = _crop_common_vocab(student_logits, teacher_logits)
+
+    reverse_k = int(cfg.get("reverse_top_k", 16))
+    forward_k = int(cfg.get("forward_top_k", 16))
+    overlap_k = int(cfg.get("overlap_top_k", 16))
+    reverse_loss, reverse_ids, reverse_local_prob = _truncated_reverse_kl(
+        student_logits, teacher_logits, reverse_k
     )
+    forward_loss, forward_ids, forward_local_prob = _truncated_forward_kl(
+        student_logits, teacher_logits, forward_k
+    )
+    overlap, student_overlap_ids, teacher_overlap_ids = _topk_overlap(
+        student_logits, teacher_logits, overlap_k
+    )
+    reverse_loss = reverse_loss.masked_fill(~active, 0.0)
+    forward_loss = forward_loss.masked_fill(~active, 0.0)
+    overlap = overlap.masked_fill(~active, 0.0)
 
+    mode = str(cfg.get("opd_loss_mode", "reverse_kl"))
+    threshold = float(cfg.get("adaptive_overlap_threshold", 0.65))
+    low_overlap = active & (overlap < threshold)
+    reverse_coef = torch.zeros_like(reverse_loss)
+    forward_coef = torch.zeros_like(forward_loss)
+    prune_weight = torch.ones_like(reverse_loss).masked_fill(~active, 0.0)
+    bad_count = torch.zeros_like(reverse_loss)
+    route = torch.zeros_like(labels[:, 1:], dtype=torch.long)
 
-def compute_cross_or_same_reverse_kl(
-    student_logits,
-    teacher_logits,
-    mask,
-    k,
-    tokenizer_alignment=None,
-):
-    if _use_cross_tokenizer(tokenizer_alignment):
-        return _cross_tokenizer_reverse_kl_topk(
-            student_logits,
-            teacher_logits,
-            mask,
-            k,
-            tokenizer_alignment,
+    if mode == "reverse_kl":
+        reverse_coef = active.float()
+        route = torch.where(active, torch.ones_like(route), route)
+    elif mode == "forward_kl":
+        forward_coef = active.float()
+        route = torch.where(active, torch.full_like(route, 2), route)
+    elif mode == "fixed_mixture":
+        alpha = float(cfg.get("mixture_forward_alpha", 0.5))
+        reverse_coef = active.float() * (1.0 - alpha)
+        forward_coef = active.float() * alpha
+        route = torch.where(active, torch.full_like(route, 3), route)
+    elif mode == "prune_opd":
+        prune_weight, low_overlap, bad_count = _prune_weights(overlap, active, cfg)
+        reverse_coef = prune_weight
+        route = torch.where(active, torch.ones_like(route), route)
+        route = torch.where(active & prune_weight.lt(1.0), torch.full_like(route, 4), route)
+    elif mode == "adaptive_v1":
+        reverse_coef = (active & ~low_overlap).float()
+        forward_coef = low_overlap.float() * float(cfg.get("adaptive_forward_lambda", 1.0))
+        route = torch.where(active & ~low_overlap, torch.ones_like(route), route)
+        route = torch.where(low_overlap, torch.full_like(route, 2), route)
+    elif mode == "adaptive_v2":
+        reverse_coef = active.float()
+        forward_coef = low_overlap.float() * float(cfg.get("adaptive_forward_lambda", 0.1))
+        route = torch.where(active & ~low_overlap, torch.ones_like(route), route)
+        route = torch.where(low_overlap, torch.full_like(route, 3), route)
+    elif mode == "prune_plus_forward":
+        prune_weight, low_overlap, bad_count = _prune_weights(overlap, active, cfg)
+        reverse_coef = prune_weight
+        forward_coef = low_overlap.float() * float(cfg.get("adaptive_forward_lambda", 0.1))
+        route = torch.where(active, torch.ones_like(route), route)
+        route = torch.where(active & prune_weight.lt(1.0), torch.full_like(route, 4), route)
+        route = torch.where(low_overlap, torch.full_like(route, 5), route)
+    else:
+        raise ValueError(f"Unsupported opd_loss_mode={mode!r}")
+
+    token_loss = reverse_coef * reverse_loss + forward_coef * forward_loss
+    final_loss = _masked_mean(token_loss, active)
+
+    logs: dict[str, float] = {
+        "opd/loss": float(final_loss.detach().cpu().item()),
+        "opd/mean_reverse_loss": float(_masked_mean(reverse_loss.detach(), active).cpu().item()),
+        "opd/mean_forward_loss": float(_masked_mean(forward_loss.detach(), active).cpu().item()),
+        "opd/mean_token_loss": float(_masked_mean(token_loss.detach(), active).cpu().item()),
+        "opd/mean_overlap": float(_masked_mean(overlap.detach(), active).cpu().item()),
+        "opd/low_overlap_fraction": float(_masked_mean(low_overlap.float(), active).cpu().item()),
+        "opd/reverse_active_fraction": float(_masked_mean(reverse_coef.gt(0).float(), active).cpu().item()),
+        "opd/forward_active_fraction": float(_masked_mean(forward_coef.gt(0).float(), active).cpu().item()),
+        "opd/reverse_plus_forward_fraction": float(
+            _masked_mean((reverse_coef.gt(0) & forward_coef.gt(0)).float(), active).cpu().item()
+        ),
+        "opd/mean_reverse_coefficient": float(_masked_mean(reverse_coef.detach(), active).cpu().item()),
+        "opd/mean_forward_coefficient": float(_masked_mean(forward_coef.detach(), active).cpu().item()),
+        "opd/mean_prune_weight": float(_masked_mean(prune_weight.detach(), active).cpu().item()),
+        "opd/first_low_overlap_position": _first_response_position(low_overlap, active),
+        "opd/common_vocab_size": float(common_vocab),
+        "opd/student_vocab_size": float(student_vocab),
+        "opd/teacher_vocab_size": float(teacher_vocab),
+        "opd/reverse_top_k": float(reverse_k),
+        "opd/forward_top_k": float(forward_k),
+        "opd/overlap_top_k": float(overlap_k),
+        "opd/overlap_reverse_loss_corr": _masked_correlation(overlap, reverse_loss, active),
+        "opd/overlap_forward_loss_corr": _masked_correlation(overlap, forward_loss, active),
+        "opd/overlap_total_loss_corr": _masked_correlation(overlap, token_loss, active),
+    }
+    for q in (0.10, 0.25, 0.50, 0.75, 0.90, 0.99):
+        suffix = int(q * 100)
+        logs[f"opd/overlap_p{suffix}"] = _masked_quantile(overlap, active, q)
+        logs[f"opd/reverse_loss_p{suffix}"] = _masked_quantile(reverse_loss, active, q)
+        logs[f"opd/forward_loss_p{suffix}"] = _masked_quantile(forward_loss, active, q)
+        logs[f"opd/token_loss_p{suffix}"] = _masked_quantile(token_loss, active, q)
+    _add_region_logs(logs, "overlap", overlap, active)
+    _add_region_logs(logs, "reverse_loss", reverse_loss, active)
+    _add_region_logs(logs, "forward_loss", forward_loss, active)
+    _add_region_logs(logs, "token_loss", token_loss, active)
+
+    diagnostics: dict[str, torch.Tensor] = {
+        "active": active,
+        "targets": labels[:, 1:],
+        "overlap": overlap,
+        "reverse_loss": reverse_loss,
+        "forward_loss": forward_loss,
+        "token_loss": token_loss,
+        "reverse_coefficient": reverse_coef,
+        "forward_coefficient": forward_coef,
+        "prune_weight": prune_weight,
+        "cumulative_low_overlap_count": bad_count,
+        "route_code": route,
+        "student_topk_ids": student_overlap_ids,
+        "teacher_topk_ids": teacher_overlap_ids,
+        "student_topk_local_prob": F.softmax(
+            student_logits.float().gather(-1, student_overlap_ids), dim=-1
+        ),
+        "teacher_topk_local_prob": F.softmax(
+            teacher_logits.float().gather(-1, teacher_overlap_ids), dim=-1
+        ),
+        "reverse_support_ids": reverse_ids,
+        "reverse_support_student_local_prob": reverse_local_prob,
+        "forward_support_ids": forward_ids,
+        "forward_support_teacher_local_prob": forward_local_prob,
+    }
+    diagnostics["student_topk_local_entropy"] = -(
+        diagnostics["student_topk_local_prob"]
+        * diagnostics["student_topk_local_prob"].clamp_min(1.0e-12).log()
+    ).sum(dim=-1)
+    diagnostics["teacher_topk_local_entropy"] = -(
+        diagnostics["teacher_topk_local_prob"]
+        * diagnostics["teacher_topk_local_prob"].clamp_min(1.0e-12).log()
+    ).sum(dim=-1)
+    logs["opd/mean_student_topk_local_entropy"] = float(
+        _masked_mean(diagnostics["student_topk_local_entropy"], active).detach().cpu().item()
+    )
+    logs["opd/mean_teacher_topk_local_entropy"] = float(
+        _masked_mean(diagnostics["teacher_topk_local_entropy"], active).detach().cpu().item()
+    )
+    if collect_diagnostics:
+        diagnostics.update(
+            _full_distribution_debug(
+                student_logits,
+                teacher_logits,
+                labels,
+                student_overlap_ids,
+                teacher_overlap_ids,
+            )
+        )
+        logs["opd/mean_student_topk_mass"] = float(
+            _masked_mean(diagnostics["student_topk_mass"], active).detach().cpu().item()
+        )
+        logs["opd/mean_teacher_topk_mass"] = float(
+            _masked_mean(diagnostics["teacher_topk_mass"], active).detach().cpu().item()
+        )
+        top1_agree = student_overlap_ids[..., 0].eq(teacher_overlap_ids[..., 0])
+        logs["opd/top1_agreement_fraction"] = float(
+            _masked_mean(top1_agree.float(), active).detach().cpu().item()
         )
 
-    return _reverse_kl_topk(
-        student_logits,
-        teacher_logits,
-        mask,
-        k,
-    )
+    return TopKOPDLossOutput(final_loss, logs, diagnostics)

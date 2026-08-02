@@ -5,170 +5,258 @@ from typing import Any
 
 import torch
 
-from .trainer import AdaptiveOPDTrainer as BaseAdaptiveOPDTrainer
-from .adaptive_kl_losses import compute_adaptive_kl_loss
+from .adaptive_kl_losses import ROUTE_NAMES, TopKOPDLossOutput, compute_topk_opd_loss
+from .trainer import AdaptiveOPDTrainer
 
 
-class AdaptiveKLTrainer(BaseAdaptiveOPDTrainer):
-    """Drop-in trainer adding forward/reverse/mixture/prune/adaptive KL losses.
+class AdaptiveKLTrainer(AdaptiveOPDTrainer):
+    """Top-K OPD trainer with scalar and per-token JSONL diagnostics."""
 
-    This version adds detailed logging for all training methods:
-      - original / trl_gjsd / sampled_rkl paths delegated to BaseAdaptiveOPDTrainer
-      - adaptive KL / top-k overlap / prune / forward KL / reverse KL paths
-
-    Use this trainer only when teacher and student tokenizers are identical for
-    adaptive KL / top-k overlap losses. The original BaseAdaptiveOPDTrainer path
-    remains available for cross-tokenizer sampled reverse KL.
-    """
-
-    def _get_global_step_safe(self) -> int:
-        try:
-            return int(self.state.global_step)
-        except Exception:
-            return -1
-
-    def _should_verbose_log(self) -> bool:
-        """Control detailed training logs.
-
-        Config options:
-          debug_train_log: bool, default True
-          debug_train_log_steps: int, default logging_steps or 1
-
-        Example YAML:
-          debug_train_log: true
-          debug_train_log_steps: 1
-        """
-        if not bool(self.experiment_config.get("debug_train_log", True)):
+    def _should_collect_token_debug(self) -> bool:
+        if not bool(self.experiment_config.get("debug_jsonl_enabled", True)):
             return False
+        every = max(int(self.experiment_config.get("debug_every_n_loss_calls", 1)), 1)
+        return self._loss_call_index % every == 0
 
-        if not self.accelerator.is_main_process:
-            return False
-
-        step = self._get_global_step_safe()
-
-        log_every = int(
-            self.experiment_config.get(
-                "debug_train_log_steps",
-                self.experiment_config.get("logging_steps", 1),
-            )
-        )
-        log_every = max(log_every, 1)
-
-        # step can stay the same during gradient accumulation, but this is still
-        # useful for debugging early training behavior.
-        return step < 5 or step % log_every == 0
-
-    def _sync_cuda_if_needed(self) -> None:
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-
-    def _tensor_stats(self, x: torch.Tensor, name: str) -> dict[str, Any]:
-        if x is None:
-            return {f"{name}/is_none": True}
-
-        stats: dict[str, Any] = {
-            f"{name}/shape": list(x.shape),
-            f"{name}/dtype": str(x.dtype),
-            f"{name}/device": str(x.device),
+    @staticmethod
+    def _tensor_description(tensor: torch.Tensor) -> dict[str, Any]:
+        return {
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "numel": int(tensor.numel()),
         }
 
-        if x.numel() > 0 and torch.is_floating_point(x):
-            with torch.no_grad():
-                finite = torch.isfinite(x)
-                stats.update(
-                    {
-                        f"{name}/finite_ratio": float(finite.float().mean().item()),
-                        f"{name}/mean": float(x[finite].mean().item()) if finite.any() else float("nan"),
-                        f"{name}/std": float(x[finite].std().item()) if finite.any() and finite.sum() > 1 else 0.0,
-                        f"{name}/min": float(x[finite].min().item()) if finite.any() else float("nan"),
-                        f"{name}/max": float(x[finite].max().item()) if finite.any() else float("nan"),
-                    }
+    @staticmethod
+    def _to_float(tensor: torch.Tensor, index: tuple[int, ...]) -> float:
+        return float(tensor[index].detach().float().cpu().item())
+
+    def _token_string(self, token_id: int, teacher: bool = False) -> str:
+        tokenizer = self.teacher_tokenizer if teacher else self.processing_class
+        try:
+            return str(tokenizer.convert_ids_to_tokens(int(token_id)))
+        except Exception:
+            return tokenizer.decode(
+                [int(token_id)],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+
+    def _topk_entries(
+        self,
+        ids: torch.Tensor,
+        local_prob: torch.Tensor,
+        full_prob: torch.Tensor | None,
+        batch_index: int,
+        sequence_index: int,
+        teacher: bool,
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for rank in range(int(ids.shape[-1])):
+            token_id = int(ids[batch_index, sequence_index, rank].detach().cpu().item())
+            entry = {
+                "rank": rank + 1,
+                "token_id": token_id,
+                "token": self._token_string(token_id, teacher=teacher),
+                "local_topk_probability": self._to_float(
+                    local_prob, (batch_index, sequence_index, rank)
+                ),
+            }
+            if full_prob is not None:
+                entry["full_vocabulary_probability"] = self._to_float(
+                    full_prob, (batch_index, sequence_index, rank)
                 )
-        return stats
+            result.append(entry)
+        return result
 
-    def _summarize_batch(self, inputs: dict[str, Any]) -> dict[str, Any]:
-        summary: dict[str, Any] = {}
+    def _write_detailed_records(
+        self,
+        inputs: dict[str, Any],
+        student_outputs: Any,
+        teacher_outputs: Any,
+        output: TopKOPDLossOutput,
+        timing: dict[str, float],
+    ) -> None:
+        diagnostics = output.diagnostics
+        active = diagnostics["active"]
+        batch_size = int(active.shape[0])
+        configured_samples = int(self.experiment_config.get("debug_samples_per_batch", 0))
+        sample_count = batch_size if configured_samples <= 0 else min(configured_samples, batch_size)
+        configured_tokens = int(self.experiment_config.get("debug_max_tokens_per_sample", 0))
 
-        input_ids = inputs.get("input_ids")
-        attention_mask = inputs.get("attention_mask")
-        labels = inputs.get("labels")
+        student_full_prob = diagnostics.get("student_topk_full_prob")
+        teacher_full_prob = diagnostics.get("teacher_topk_full_prob")
+        student_target_logp = diagnostics.get("student_target_logp")
+        teacher_target_logp = diagnostics.get("teacher_target_logp")
 
-        if isinstance(input_ids, torch.Tensor):
-            summary["batch/input_ids_shape"] = list(input_ids.shape)
-            summary["batch/input_ids_dtype"] = str(input_ids.dtype)
-            summary["batch/input_ids_device"] = str(input_ids.device)
-            summary["batch/batch_size"] = int(input_ids.shape[0]) if input_ids.ndim >= 1 else 0
-            summary["batch/seq_len"] = int(input_ids.shape[1]) if input_ids.ndim >= 2 else 0
+        for batch_index in range(sample_count):
+            positions = torch.where(active[batch_index])[0].detach().cpu().tolist()
+            if configured_tokens > 0:
+                positions = positions[:configured_tokens]
+            token_records: list[dict[str, Any]] = []
+            for response_index, sequence_index in enumerate(positions, start=1):
+                target_id = int(
+                    diagnostics["targets"][batch_index, sequence_index].detach().cpu().item()
+                )
+                route_code = int(
+                    diagnostics["route_code"][batch_index, sequence_index].detach().cpu().item()
+                )
+                student_ids = diagnostics["student_topk_ids"]
+                teacher_ids = diagnostics["teacher_topk_ids"]
+                target_in_student_topk = bool(
+                    student_ids[batch_index, sequence_index].eq(target_id).any().item()
+                )
+                target_in_teacher_topk = bool(
+                    teacher_ids[batch_index, sequence_index].eq(target_id).any().item()
+                )
+                student_target_matches = torch.where(
+                    student_ids[batch_index, sequence_index].eq(target_id)
+                )[0]
+                teacher_target_matches = torch.where(
+                    teacher_ids[batch_index, sequence_index].eq(target_id)
+                )[0]
+                student_id_list = [
+                    int(x) for x in student_ids[batch_index, sequence_index].detach().cpu().tolist()
+                ]
+                teacher_id_set = {
+                    int(x) for x in teacher_ids[batch_index, sequence_index].detach().cpu().tolist()
+                }
+                intersection_ids = [token_id for token_id in student_id_list if token_id in teacher_id_set]
+                record: dict[str, Any] = {
+                    "response_position": response_index,
+                    "sequence_position": int(sequence_index) + 1,
+                    "target_token_id": target_id,
+                    "target_token": self._token_string(target_id),
+                    "loss_route": ROUTE_NAMES.get(route_code, f"unknown_{route_code}"),
+                    "overlap": self._to_float(diagnostics["overlap"], (batch_index, sequence_index)),
+                    "reverse_kl": self._to_float(diagnostics["reverse_loss"], (batch_index, sequence_index)),
+                    "forward_kl": self._to_float(diagnostics["forward_loss"], (batch_index, sequence_index)),
+                    "reverse_coefficient": self._to_float(
+                        diagnostics["reverse_coefficient"], (batch_index, sequence_index)
+                    ),
+                    "forward_coefficient": self._to_float(
+                        diagnostics["forward_coefficient"], (batch_index, sequence_index)
+                    ),
+                    "prune_weight": self._to_float(
+                        diagnostics["prune_weight"], (batch_index, sequence_index)
+                    ),
+                    "cumulative_low_overlap_count": self._to_float(
+                        diagnostics["cumulative_low_overlap_count"],
+                        (batch_index, sequence_index),
+                    ),
+                    "final_token_loss": self._to_float(
+                        diagnostics["token_loss"], (batch_index, sequence_index)
+                    ),
+                    "target_in_student_topk": target_in_student_topk,
+                    "target_in_teacher_topk": target_in_teacher_topk,
+                    "target_rank_in_student_topk": (
+                        int(student_target_matches[0].detach().cpu().item()) + 1
+                        if student_target_matches.numel() else None
+                    ),
+                    "target_rank_in_teacher_topk": (
+                        int(teacher_target_matches[0].detach().cpu().item()) + 1
+                        if teacher_target_matches.numel() else None
+                    ),
+                    "topk_intersection_count": len(intersection_ids),
+                    "topk_intersection": [
+                        {
+                            "token_id": token_id,
+                            "token": self._token_string(token_id),
+                        }
+                        for token_id in intersection_ids
+                    ],
+                    "student_topk_local_entropy": self._to_float(
+                        diagnostics["student_topk_local_entropy"],
+                        (batch_index, sequence_index),
+                    ),
+                    "teacher_topk_local_entropy": self._to_float(
+                        diagnostics["teacher_topk_local_entropy"],
+                        (batch_index, sequence_index),
+                    ),
+                    "student_topk": self._topk_entries(
+                        student_ids,
+                        diagnostics["student_topk_local_prob"],
+                        student_full_prob,
+                        batch_index,
+                        sequence_index,
+                        teacher=False,
+                    ),
+                    "teacher_topk": self._topk_entries(
+                        teacher_ids,
+                        diagnostics["teacher_topk_local_prob"],
+                        teacher_full_prob,
+                        batch_index,
+                        sequence_index,
+                        teacher=True,
+                    ),
+                }
+                if student_target_logp is not None and teacher_target_logp is not None:
+                    student_logp = self._to_float(
+                        student_target_logp, (batch_index, sequence_index)
+                    )
+                    teacher_logp = self._to_float(
+                        teacher_target_logp, (batch_index, sequence_index)
+                    )
+                    record.update(
+                        student_target_log_probability=student_logp,
+                        teacher_target_log_probability=teacher_logp,
+                        sampled_token_log_ratio=student_logp - teacher_logp,
+                        student_topk_probability_mass=self._to_float(
+                            diagnostics["student_topk_mass"],
+                            (batch_index, sequence_index),
+                        ),
+                        teacher_topk_probability_mass=self._to_float(
+                            diagnostics["teacher_topk_mass"],
+                            (batch_index, sequence_index),
+                        ),
+                    )
+                token_records.append(record)
 
-        if isinstance(attention_mask, torch.Tensor):
-            with torch.no_grad():
-                lengths = attention_mask.sum(dim=1).float() if attention_mask.ndim == 2 else attention_mask.float()
-                summary["batch/attention_tokens_total"] = int(attention_mask.sum().item())
-                summary["batch/attention_len_mean"] = float(lengths.mean().item())
-                summary["batch/attention_len_min"] = float(lengths.min().item())
-                summary["batch/attention_len_max"] = float(lengths.max().item())
-
-        if isinstance(labels, torch.Tensor):
-            with torch.no_grad():
-                valid = labels.ne(-100)
-                valid_per_sample = valid.sum(dim=1).float() if labels.ndim == 2 else valid.float()
-                summary["batch/label_shape"] = list(labels.shape)
-                summary["batch/label_valid_tokens_total"] = int(valid.sum().item())
-                summary["batch/label_valid_len_mean"] = float(valid_per_sample.mean().item())
-                summary["batch/label_valid_len_min"] = float(valid_per_sample.min().item())
-                summary["batch/label_valid_len_max"] = float(valid_per_sample.max().item())
-
-                if isinstance(attention_mask, torch.Tensor) and attention_mask.shape == labels.shape:
-                    prompt_like = attention_mask.bool() & labels.eq(-100)
-                    prompt_like_per_sample = prompt_like.sum(dim=1).float()
-                    summary["batch/prompt_like_tokens_total"] = int(prompt_like.sum().item())
-                    summary["batch/prompt_like_len_mean"] = float(prompt_like_per_sample.mean().item())
-                    summary["batch/prompt_like_len_min"] = float(prompt_like_per_sample.min().item())
-                    summary["batch/prompt_like_len_max"] = float(prompt_like_per_sample.max().item())
-
-        return summary
-
-    def _print_debug_block(self, title: str, payload: dict[str, Any]) -> None:
-        if not self._should_verbose_log():
-            return
-
-        step = self._get_global_step_safe()
-        rank = getattr(self.accelerator, "process_index", 0)
-
-        print("")
-        print("=" * 90)
-        print(f"[AdaptiveKLTrainer DEBUG] {title}")
-        print(f"step={step} rank={rank}")
-        print("-" * 90)
-
-        for key in sorted(payload.keys()):
-            value = payload[key]
-            if isinstance(value, float):
-                print(f"{key}: {value:.6f}")
-            else:
-                print(f"{key}: {value}")
-
-        print("=" * 90)
-        print("", flush=True)
-
-    def _log_to_trainer(self, payload: dict[str, Any]) -> None:
-        """Log numeric values into Trainer/Accelerate logger."""
-        numeric_payload: dict[str, float] = {}
-        for key, value in payload.items():
-            if isinstance(value, bool):
-                numeric_payload[key] = float(value)
-            elif isinstance(value, int):
-                numeric_payload[key] = float(value)
-            elif isinstance(value, float):
-                numeric_payload[key] = value
-            elif isinstance(value, torch.Tensor) and value.numel() == 1:
-                numeric_payload[key] = float(value.detach().float().cpu().item())
-
-        if numeric_payload and self.accelerator.sync_gradients:
-            self.log(numeric_payload)
+            rollout_texts = inputs.get("debug_rollout_text", [""] * batch_size)
+            rollout_lengths = inputs.get("debug_rollout_length", [len(positions)] * batch_size)
+            problems = inputs.get("debug_problem", [""] * batch_size)
+            prompt_texts = inputs.get("debug_prompt_text", [""] * batch_size)
+            eos_flags = inputs.get("debug_eos", [False] * batch_size)
+            record = {
+                "event": "topk_opd_sample_debug",
+                "global_step": int(self.state.global_step),
+                "loss_call_index": int(self._loss_call_index),
+                "rank": int(self.accelerator.process_index),
+                "backend": self.loss_backend,
+                "loss_mode": self.opd_loss_mode,
+                "strategy": self.strategy,
+                "horizon": int(inputs.get("debug_horizon", -1)),
+                "sample_index_in_batch": batch_index,
+                "problem": problems[batch_index],
+                "prompt_text": prompt_texts[batch_index],
+                "student_rollout": rollout_texts[batch_index],
+                "student_rollout_length": int(rollout_lengths[batch_index]),
+                "student_emitted_eos": bool(eos_flags[batch_index]),
+                "logged_token_count": len(token_records),
+                "student_forward": {
+                    "input_ids": self._tensor_description(inputs["input_ids"]),
+                    "attention_mask": self._tensor_description(inputs["attention_mask"]),
+                    "logits": self._tensor_description(student_outputs.logits),
+                    "elapsed_seconds": timing["student_forward_sec"],
+                },
+                "teacher_forward": {
+                    "input_ids": self._tensor_description(inputs["input_ids"]),
+                    "attention_mask": self._tensor_description(inputs["attention_mask"]),
+                    "logits": self._tensor_description(teacher_outputs.logits),
+                    "elapsed_seconds": timing["teacher_forward_sec"],
+                },
+                "loss_compute_seconds": timing["loss_compute_sec"],
+                "total_compute_seconds": timing["total_compute_sec"],
+                "batch_scalar_metrics": output.logs,
+                "tokens": token_records,
+            }
+            if torch.cuda.is_available():
+                record["cuda_memory"] = {
+                    "allocated_bytes": int(torch.cuda.memory_allocated()),
+                    "reserved_bytes": int(torch.cuda.memory_reserved()),
+                    "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                }
+            self._write_jsonl(record)
 
     def compute_loss(
         self,
@@ -176,259 +264,91 @@ class AdaptiveKLTrainer(BaseAdaptiveOPDTrainer):
         inputs: dict[str, Any],
         return_outputs: bool = False,
         num_items_in_batch: int | None = None,
-    ):
-        mode = str(self.experiment_config.get("opd_loss_mode", "original"))
-        strategy = str(self.experiment_config.get("strategy", "unknown"))
-        step = self._get_global_step_safe()
-
-        base_payload: dict[str, Any] = {
-            "step": step,
-            "mode/opd_loss_mode": mode,
-            "mode/strategy": strategy,
-            "mode/loss_backend": getattr(self, "loss_backend", None),
-            "mode/same_tokenizer": bool(getattr(self, "same_tokenizer", False)),
-            "mode/return_outputs": bool(return_outputs),
-            "mode/num_items_in_batch": num_items_in_batch,
-            "config/max_length": self.experiment_config.get("max_length"),
-            "config/max_prompt_length": self.experiment_config.get("max_prompt_length"),
-            "config/full_max_new_tokens": self.experiment_config.get("full_max_new_tokens"),
-            "config/lite_max_new_tokens": self.experiment_config.get("lite_max_new_tokens"),
-            "config/esr_cut_length": self.experiment_config.get("esr_cut_length"),
-            "args/max_new_tokens": getattr(self.args, "max_new_tokens", None),
-            "args/per_device_train_batch_size": getattr(self.args, "per_device_train_batch_size", None),
-            "args/gradient_accumulation_steps": getattr(self.args, "gradient_accumulation_steps", None),
-        }
-        base_payload.update(self._summarize_batch(inputs))
-
-        # ---------------------------------------------------------------------
-        # Original TRL/GKD/sample reverse KL path.
-        # ---------------------------------------------------------------------
-        # Route by the actual implementation backend first.
-        # `opd_loss_mode` is sometimes used as an experiment label, e.g.
-        # opd_loss_mode=reverse_kl while loss_backend=sampled_rkl for ESR.
-        # In that case we must delegate to the base sampled-RKL trainer and
-        # must NOT enter the adaptive top-k loss path.
-        loss_backend = str(
-            getattr(self, "loss_backend", self.experiment_config.get("loss_backend", "auto"))
-        )
-        delegate_to_base = (
-            loss_backend in {"sampled_rkl", "trl_gjsd"}
-            or mode in {"original", "trl_gjsd", "sampled_rkl"}
-        )
-
-        if delegate_to_base:
-            self._print_debug_block(
-                title="Entering base OPD/GKD loss path",
-                payload={
-                    **base_payload,
-                    "path": "super.compute_loss",
-                    "note": (
-                        "This path is delegated to BaseAdaptiveOPDTrainer. "
-                        "If it is slow, inspect rollout generation and teacher forward inside the base trainer."
-                    ),
-                },
-            )
-
-            self._sync_cuda_if_needed()
-            t0 = time.perf_counter()
-
-            loss_or_outputs = super().compute_loss(
+    ) -> Any:
+        if self.loss_backend == "sampled_rkl":
+            return super().compute_loss(
                 model,
                 inputs,
                 return_outputs=return_outputs,
                 num_items_in_batch=num_items_in_batch,
             )
+        del num_items_in_batch
+        self._loss_call_index += 1
+        collect_debug = self._should_collect_token_debug()
 
-            self._sync_cuda_if_needed()
-            elapsed = time.perf_counter() - t0
-
-            if return_outputs:
-                loss_value = loss_or_outputs[0]
-            else:
-                loss_value = loss_or_outputs
-
-            final_payload = {
-                **base_payload,
-                "path": "super.compute_loss",
-                "timing/total_compute_loss_sec": elapsed,
-                "loss/value": float(loss_value.detach().float().cpu().item())
-                if isinstance(loss_value, torch.Tensor)
-                else None,
-            }
-
-            self._print_debug_block(
-                title="Finished base OPD/GKD loss path",
-                payload=final_payload,
-            )
-            self._log_to_trainer(
-                {
-                    "debug/base_total_compute_loss_sec": elapsed,
-                    "debug/base_loss": final_payload["loss/value"]
-                    if final_payload["loss/value"] is not None
-                    else 0.0,
-                }
-            )
-
-            return loss_or_outputs
-
-        # ---------------------------------------------------------------------
-        # Adaptive KL / prune / top-k overlap path.
-        # ---------------------------------------------------------------------
-        if not self.same_tokenizer:
-            # Your Qwen2.5 student / Qwen3 teacher case is prefix-compatible:
-            # the teacher only appends a few special tokens at the end.  In that
-            # case we do NOT need a tokenizer_alignment file; the adaptive loss
-            # will crop both logits to the common prefix vocabulary.
-            has_alignment = hasattr(self, "tokenizer_alignment")
-            prefix_ok = bool(getattr(self, "prefix_compatible_tokenizer", False))
-            allow_prefix = bool(
-                self.experiment_config.get("adaptive_allow_prefix_vocab_compatible", True)
-            )
-
-            if has_alignment:
-                if self.accelerator.is_main_process:
-                    print(
-                        "[Tokenizer Alignment] "
-                        f"shared_ratio={self.tokenizer_alignment.shared_ratio:.4f}, "
-                        f"teacher_only={self.tokenizer_alignment.teacher_only}, "
-                        f"student_only={self.tokenizer_alignment.student_only}"
-                    )
-            elif allow_prefix and prefix_ok:
-                if self.accelerator.is_main_process:
-                    print(
-                        "[Adaptive OPD] Non-identical but prefix-compatible tokenizers detected. "
-                        f"common_vocab_size={getattr(self, 'common_vocab_size', 'unknown')}. "
-                        "No tokenizer_alignment file is needed; teacher-only trailing tokens are ignored."
-                    )
-            else:
-                raise ValueError(
-                    "Tokenizer mismatch detected. No tokenizer_alignment is available, and "
-                    "the tokenizers were not recognized as prefix-compatible. If the teacher "
-                    "only appends extra special tokens at the end, set "
-                    "adaptive_allow_prefix_vocab_compatible=true and make sure trainer.py "
-                    "computes prefix_compatible_tokenizer/common_vocab_size."
-                )
-
-        self._print_debug_block(
-            title="Entering adaptive KL loss path",
-            payload={
-                **base_payload,
-                "path": "adaptive_kl",
-                "note": (
-                    "This path performs student forward and teacher forward on inputs['input_ids']. "
-                    "If lite_prune is as slow as full OPD, check whether input_ids length and teacher forward length are actually reduced."
-                ),
-            },
-        )
-
-        total_t0 = time.perf_counter()
-
-        # Student forward.
-        self._sync_cuda_if_needed()
-        student_t0 = time.perf_counter()
-
+        total_start = time.perf_counter()
+        student_start = time.perf_counter()
         student_outputs = model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             use_cache=False,
         )
+        student_elapsed = time.perf_counter() - student_start
 
-        self._sync_cuda_if_needed()
-        student_elapsed = time.perf_counter() - student_t0
-
-        # Teacher forward.
+        teacher_start = time.perf_counter()
         self.teacher_model.eval()
-        self._sync_cuda_if_needed()
-        teacher_t0 = time.perf_counter()
-
         with torch.no_grad():
             teacher_outputs = self.teacher_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 use_cache=False,
             )
+        teacher_elapsed = time.perf_counter() - teacher_start
 
-        self._sync_cuda_if_needed()
-        teacher_elapsed = time.perf_counter() - teacher_t0
-
-        # Loss computation.
-        loss_t0 = time.perf_counter()
-
-        out = compute_adaptive_kl_loss(
+        loss_start = time.perf_counter()
+        output = compute_topk_opd_loss(
             student_logits_raw=student_outputs.logits,
             teacher_logits_raw=teacher_outputs.logits,
             labels=inputs["labels"],
             cfg=self.experiment_config,
-            tokenizer_alignment=getattr(
-                self,
-                "tokenizer_alignment",
-                None,
-            ),
+            collect_diagnostics=collect_debug,
         )
-
-        self._sync_cuda_if_needed()
-        loss_elapsed = time.perf_counter() - loss_t0
-        total_elapsed = time.perf_counter() - total_t0
-
-        debug_payload: dict[str, Any] = {
-            **base_payload,
-            "path": "adaptive_kl",
-            "timing/student_forward_sec": student_elapsed,
-            "timing/teacher_forward_sec": teacher_elapsed,
-            "timing/loss_compute_sec": loss_elapsed,
-            "timing/total_compute_loss_sec": total_elapsed,
-            "loss/value": float(out.loss.detach().float().cpu().item()),
-        }
-
-        debug_payload.update(self._tensor_stats(student_outputs.logits, "student_logits"))
-        debug_payload.update(self._tensor_stats(teacher_outputs.logits, "teacher_logits"))
-
-        # Add internal loss logs from compute_adaptive_kl_loss.
-        if hasattr(out, "logs") and isinstance(out.logs, dict):
-            for key, value in out.logs.items():
-                safe_key = f"adaptive_loss/{key}"
-                if isinstance(value, torch.Tensor):
-                    if value.numel() == 1:
-                        debug_payload[safe_key] = float(value.detach().float().cpu().item())
-                    else:
-                        debug_payload[f"{safe_key}/shape"] = list(value.shape)
-                else:
-                    debug_payload[safe_key] = value
-
-        # Helpful derived speed ratios.
-        if total_elapsed > 0:
-            debug_payload["timing/student_forward_ratio"] = student_elapsed / total_elapsed
-            debug_payload["timing/teacher_forward_ratio"] = teacher_elapsed / total_elapsed
-            debug_payload["timing/loss_compute_ratio"] = loss_elapsed / total_elapsed
-
-        if teacher_elapsed > 0:
-            debug_payload["timing/student_to_teacher_forward_ratio"] = student_elapsed / teacher_elapsed
-
-        self._print_debug_block(
-            title="Finished adaptive KL loss path",
-            payload=debug_payload,
+        loss_elapsed = time.perf_counter() - loss_start
+        total_elapsed = time.perf_counter() - total_start
+        output.logs.update(
+            {
+                "timing/student_forward_sec": float(student_elapsed),
+                "timing/teacher_forward_sec": float(teacher_elapsed),
+                "timing/loss_compute_sec": float(loss_elapsed),
+                "timing/total_compute_sec": float(total_elapsed),
+                "tensor/student_batch_size": float(student_outputs.logits.shape[0]),
+                "tensor/student_sequence_length": float(student_outputs.logits.shape[1]),
+                "tensor/student_vocab_size": float(student_outputs.logits.shape[2]),
+                "tensor/teacher_sequence_length": float(teacher_outputs.logits.shape[1]),
+                "tensor/teacher_vocab_size": float(teacher_outputs.logits.shape[2]),
+            }
         )
+        self.log(output.logs)
 
-        # Log to Trainer as scalar metrics.
-        scalar_log_payload = {
-            "debug/student_forward_sec": student_elapsed,
-            "debug/teacher_forward_sec": teacher_elapsed,
-            "debug/loss_compute_sec": loss_elapsed,
-            "debug/total_compute_loss_sec": total_elapsed,
-            "debug/adaptive_loss": float(out.loss.detach().float().cpu().item()),
-        }
+        if collect_debug:
+            self._write_detailed_records(
+                inputs,
+                student_outputs,
+                teacher_outputs,
+                output,
+                {
+                    "student_forward_sec": student_elapsed,
+                    "teacher_forward_sec": teacher_elapsed,
+                    "loss_compute_sec": loss_elapsed,
+                    "total_compute_sec": total_elapsed,
+                },
+            )
 
-        if hasattr(out, "logs") and isinstance(out.logs, dict):
-            for key, value in out.logs.items():
-                if isinstance(value, torch.Tensor) and value.numel() == 1:
-                    scalar_log_payload[f"loss_detail/{key}"] = float(value.detach().float().cpu().item())
-                elif isinstance(value, (int, float, bool)):
-                    scalar_log_payload[f"loss_detail/{key}"] = float(value)
+        summary_every = max(
+            int(self.experiment_config.get("debug_summary_every_n_loss_calls", 1)), 1
+        )
+        if self.accelerator.is_local_main_process and self._loss_call_index % summary_every == 0:
+            print(
+                "[Top-K OPD] "
+                f"step={self.state.global_step} call={self._loss_call_index} "
+                f"mode={self.opd_loss_mode} loss={output.logs['opd/loss']:.6f} "
+                f"RKL={output.logs['opd/mean_reverse_loss']:.6f} "
+                f"FKL={output.logs['opd/mean_forward_loss']:.6f} "
+                f"overlap={output.logs['opd/mean_overlap']:.4f} "
+                f"low={output.logs['opd/low_overlap_fraction']:.4f} "
+                f"student_shape={list(student_outputs.logits.shape)} "
+                f"teacher_shape={list(teacher_outputs.logits.shape)}",
+                flush=True,
+            )
 
-        self._log_to_trainer(scalar_log_payload)
-
-        # Keep the original behavior.
-        if self.accelerator.sync_gradients and hasattr(out, "logs"):
-            self.log(out.logs)
-
-        return (out.loss, student_outputs) if return_outputs else out.loss
+        return (output.loss, student_outputs) if return_outputs else output.loss
