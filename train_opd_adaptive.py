@@ -64,6 +64,17 @@ def main() -> None:
             "loss_mode": cfg["opd_loss_mode"],
             "strategy": cfg["strategy"],
             "rollout_horizon": cfg["effective_max_new_tokens"],
+            "rollout_include_teacher_eos": cfg.get("rollout_include_teacher_eos", True),
+            "rollout_extra_eos_tokens": cfg.get("rollout_extra_eos_tokens", []),
+            "rollout_truncate_after_boxed_answer": cfg.get(
+                "rollout_truncate_after_boxed_answer", False
+            ),
+            "rollout_append_eos_after_boxed_answer": cfg.get(
+                "rollout_append_eos_after_boxed_answer", False
+            ),
+            "truncated_rollout_weight": cfg.get("truncated_rollout_weight", 0.0),
+            "loss_normalization": cfg.get("loss_normalization", "per_sequence"),
+            "rollout_repetition_ngram_size": cfg.get("rollout_repetition_ngram_size", 4),
             "reverse_top_k": cfg.get("reverse_top_k"),
             "forward_top_k": cfg.get("forward_top_k"),
             "overlap_top_k": cfg.get("overlap_top_k"),

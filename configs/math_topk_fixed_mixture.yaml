@@ -3,4 +3,4 @@ strategy: full
 loss_backend: adaptive_opd
 opd_loss_mode: fixed_mixture
 mixture_forward_alpha: 0.5
-output_dir: outputs/qwen25_math_15b_to_qwen3_4b_topk16_fixed_mix_fwd050
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_topk16_fixed_mix_fwd050_eos_safe

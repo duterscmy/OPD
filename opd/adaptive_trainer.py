@@ -127,6 +127,7 @@ class AdaptiveKLTrainer(AdaptiveOPDTrainer):
                     "sequence_position": int(sequence_index) + 1,
                     "target_token_id": target_id,
                     "target_token": self._token_string(target_id),
+                    "target_is_rollout_eos": target_id in self.rollout_eos_token_ids,
                     "loss_route": ROUTE_NAMES.get(route_code, f"unknown_{route_code}"),
                     "overlap": self._to_float(diagnostics["overlap"], (batch_index, sequence_index)),
                     "reverse_kl": self._to_float(diagnostics["reverse_loss"], (batch_index, sequence_index)),
@@ -213,10 +214,34 @@ class AdaptiveKLTrainer(AdaptiveOPDTrainer):
                 token_records.append(record)
 
             rollout_texts = inputs.get("debug_rollout_text", [""] * batch_size)
+            prompt_lengths = inputs.get("debug_prompt_length", [0] * batch_size)
             rollout_lengths = inputs.get("debug_rollout_length", [len(positions)] * batch_size)
+            raw_rollout_lengths = inputs.get("debug_raw_rollout_length", rollout_lengths)
             problems = inputs.get("debug_problem", [""] * batch_size)
             prompt_texts = inputs.get("debug_prompt_text", [""] * batch_size)
             eos_flags = inputs.get("debug_eos", [False] * batch_size)
+            stop_reasons = inputs.get("debug_stop_reason", ["unknown"] * batch_size)
+            stop_token_ids = inputs.get("debug_stop_token_id", [None] * batch_size)
+            stop_tokens = inputs.get("debug_stop_token", [""] * batch_size)
+            hit_horizon = inputs.get("debug_hit_horizon", [False] * batch_size)
+            raw_hit_horizon = inputs.get(
+                "debug_raw_hit_horizon", hit_horizon
+            )
+            boxed_truncated = inputs.get(
+                "debug_boxed_truncated", [False] * batch_size
+            )
+            appended_eos = inputs.get("debug_appended_eos", [False] * batch_size)
+            repetition = inputs.get("debug_repeated_ngram_ratio", [0.0] * batch_size)
+            effective_repetition = inputs.get(
+                "debug_effective_repeated_ngram_ratio", repetition
+            )
+            boxed_counts = inputs.get("debug_boxed_count", [0] * batch_size)
+            effective_boxed_counts = inputs.get(
+                "debug_effective_boxed_count", boxed_counts
+            )
+            sequence_loss_weights = inputs.get(
+                "debug_sequence_loss_weight", [1.0] * batch_size
+            )
             record = {
                 "event": "topk_opd_sample_debug",
                 "global_step": int(self.state.global_step),
@@ -230,8 +255,28 @@ class AdaptiveKLTrainer(AdaptiveOPDTrainer):
                 "problem": problems[batch_index],
                 "prompt_text": prompt_texts[batch_index],
                 "student_rollout": rollout_texts[batch_index],
+                "student_prompt_length": int(prompt_lengths[batch_index]),
                 "student_rollout_length": int(rollout_lengths[batch_index]),
+                "student_raw_rollout_length": int(raw_rollout_lengths[batch_index]),
                 "student_emitted_eos": bool(eos_flags[batch_index]),
+                "student_stop_reason": str(stop_reasons[batch_index]),
+                "student_stop_token_id": stop_token_ids[batch_index],
+                "student_stop_token": str(stop_tokens[batch_index]),
+                "student_hit_horizon": bool(hit_horizon[batch_index]),
+                "student_raw_hit_horizon": bool(raw_hit_horizon[batch_index]),
+                "student_truncated_after_boxed_answer": bool(
+                    boxed_truncated[batch_index]
+                ),
+                "student_appended_eos": bool(appended_eos[batch_index]),
+                "student_repeated_ngram_ratio": float(repetition[batch_index]),
+                "student_effective_repeated_ngram_ratio": float(
+                    effective_repetition[batch_index]
+                ),
+                "student_boxed_count": int(boxed_counts[batch_index]),
+                "student_effective_boxed_count": int(
+                    effective_boxed_counts[batch_index]
+                ),
+                "sequence_loss_weight": float(sequence_loss_weights[batch_index]),
                 "logged_token_count": len(token_records),
                 "student_forward": {
                     "input_ids": self._tensor_description(inputs["input_ids"]),
@@ -257,6 +302,140 @@ class AdaptiveKLTrainer(AdaptiveOPDTrainer):
                     "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
                 }
             self._write_jsonl(record)
+
+    @staticmethod
+    def _mean_token_set_probability(
+        logits: torch.Tensor,
+        token_ids: list[int],
+    ) -> float:
+        if logits.numel() == 0:
+            return 0.0
+        valid_ids = [token_id for token_id in token_ids if 0 <= token_id < logits.shape[-1]]
+        if not valid_ids:
+            return 0.0
+        selected = logits.float()
+        token_logits = selected[:, valid_ids]
+        log_z = torch.logsumexp(selected, dim=-1, keepdim=True)
+        probability = torch.exp(token_logits - log_z).sum(dim=-1)
+        return float(probability.detach().mean().cpu().item())
+
+    def _add_eos_diagnostics(
+        self,
+        output: TopKOPDLossOutput,
+        student_outputs: Any,
+        teacher_outputs: Any,
+        inputs: dict[str, Any],
+    ) -> None:
+        labels = inputs["labels"][:, 1:]
+        active = labels.ne(-100)
+        eos_target = torch.zeros_like(active)
+        for token_id in self.rollout_eos_token_ids:
+            eos_target |= labels.eq(int(token_id))
+        eos_target &= active
+
+        student_shifted = student_outputs.logits[:, :-1, :]
+        teacher_shifted = teacher_outputs.logits[:, :-1, :]
+        output.logs["opd/eos_target_fraction"] = float(
+            (eos_target.float().sum() / active.float().sum().clamp_min(1.0))
+            .detach()
+            .cpu()
+            .item()
+        )
+        output.logs["opd/student_eos_target_probability"] = self._mean_token_set_probability(
+            student_shifted[eos_target], self.rollout_eos_token_ids
+        )
+        output.logs["opd/teacher_eos_target_probability"] = self._mean_token_set_probability(
+            teacher_shifted[eos_target], self.rollout_eos_token_ids
+        )
+
+        if bool(eos_target.any().item()):
+            targets = labels.clamp_min(0).unsqueeze(-1)
+            student_contains_target = output.diagnostics["student_topk_ids"].eq(targets).any(dim=-1)
+            teacher_contains_target = output.diagnostics["teacher_topk_ids"].eq(targets).any(dim=-1)
+            output.logs["opd/eos_target_in_student_topk_fraction"] = float(
+                student_contains_target[eos_target].float().mean().detach().cpu().item()
+            )
+            output.logs["opd/eos_target_in_teacher_topk_fraction"] = float(
+                teacher_contains_target[eos_target].float().mean().detach().cpu().item()
+            )
+        else:
+            output.logs["opd/eos_target_in_student_topk_fraction"] = 0.0
+            output.logs["opd/eos_target_in_teacher_topk_fraction"] = 0.0
+
+        truncated_indices = [
+            index
+            for index, hit_horizon in enumerate(inputs.get("debug_hit_horizon", []))
+            if bool(hit_horizon)
+        ]
+        student_next_logits: list[torch.Tensor] = []
+        teacher_next_logits: list[torch.Tensor] = []
+        for batch_index in truncated_indices:
+            positions = torch.where(inputs["attention_mask"][batch_index].bool())[0]
+            if positions.numel() == 0:
+                continue
+            final_position = int(positions[-1].detach().cpu().item())
+            student_next_logits.append(student_outputs.logits[batch_index, final_position])
+            teacher_next_logits.append(teacher_outputs.logits[batch_index, final_position])
+
+        if student_next_logits:
+            output.logs["opd/truncated_student_next_eos_probability"] = (
+                self._mean_token_set_probability(
+                    torch.stack(student_next_logits), self.rollout_eos_token_ids
+                )
+            )
+            output.logs["opd/truncated_teacher_next_eos_probability"] = (
+                self._mean_token_set_probability(
+                    torch.stack(teacher_next_logits), self.rollout_eos_token_ids
+                )
+            )
+        else:
+            output.logs["opd/truncated_student_next_eos_probability"] = 0.0
+            output.logs["opd/truncated_teacher_next_eos_probability"] = 0.0
+
+        boxed_indices = [
+            index
+            for index, boxed_truncated in enumerate(
+                inputs.get("debug_boxed_truncated", [])
+            )
+            if bool(boxed_truncated)
+        ]
+        boxed_student_next_logits: list[torch.Tensor] = []
+        boxed_teacher_next_logits: list[torch.Tensor] = []
+        appended_eos_flags = inputs.get("debug_appended_eos", [])
+        for batch_index in boxed_indices:
+            positions = torch.where(inputs["attention_mask"][batch_index].bool())[0]
+            if positions.numel() == 0:
+                continue
+            final_position = int(positions[-1].detach().cpu().item())
+            # If EOS was appended as the supervised terminal boundary, use the
+            # preceding position: its logits are the ones that predict EOS.
+            if (
+                batch_index < len(appended_eos_flags)
+                and bool(appended_eos_flags[batch_index])
+            ):
+                final_position -= 1
+            if final_position < 0:
+                continue
+            boxed_student_next_logits.append(
+                student_outputs.logits[batch_index, final_position]
+            )
+            boxed_teacher_next_logits.append(
+                teacher_outputs.logits[batch_index, final_position]
+            )
+        if boxed_student_next_logits:
+            output.logs["opd/boxed_student_next_eos_probability"] = (
+                self._mean_token_set_probability(
+                    torch.stack(boxed_student_next_logits), self.rollout_eos_token_ids
+                )
+            )
+            output.logs["opd/boxed_teacher_next_eos_probability"] = (
+                self._mean_token_set_probability(
+                    torch.stack(boxed_teacher_next_logits), self.rollout_eos_token_ids
+                )
+            )
+        else:
+            output.logs["opd/boxed_student_next_eos_probability"] = 0.0
+            output.logs["opd/boxed_teacher_next_eos_probability"] = 0.0
 
     def compute_loss(
         self,
@@ -302,7 +481,9 @@ class AdaptiveKLTrainer(AdaptiveOPDTrainer):
             labels=inputs["labels"],
             cfg=self.experiment_config,
             collect_diagnostics=collect_debug,
+            sequence_weights=inputs.get("sequence_loss_weights"),
         )
+        self._add_eos_diagnostics(output, student_outputs, teacher_outputs, inputs)
         loss_elapsed = time.perf_counter() - loss_start
         total_elapsed = time.perf_counter() - total_start
         output.logs.update(

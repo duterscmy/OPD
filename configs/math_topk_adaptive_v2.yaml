@@ -5,4 +5,4 @@ opd_loss_mode: adaptive_v2
 adaptive_overlap_threshold: 0.55
 # High overlap: RKL. Low overlap: RKL + 0.10 * FKL.
 adaptive_forward_lambda: 0.10
-output_dir: outputs/qwen25_math_15b_to_qwen3_4b_topk16_adaptive_v2_t065_lam010
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_topk16_adaptive_v2_t065_lam010_eos_safe

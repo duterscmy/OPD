@@ -12,6 +12,14 @@ from trl.models.utils import unwrap_model_for_generation
 
 from .alignment import build_text_span_alignment
 from .collator import apply_chat_template_ids
+from .rollout_safety import (
+    RolloutEOSInfo,
+    TruncatedCompletion,
+    finalize_math_completion,
+    repeated_ngram_ratio,
+    resolve_rollout_eos,
+    truncate_completion,
+)
 from .schedules import HorizonSchedule
 
 
@@ -72,6 +80,43 @@ class AdaptiveOPDTrainer(GKDTrainer):
             self.processing_class, teacher_tokenizer
         )
         self.common_vocab_size = min(len(self.processing_class), len(teacher_tokenizer))
+        extra_eos_tokens = experiment_config.get("rollout_extra_eos_tokens", [])
+        if isinstance(extra_eos_tokens, str):
+            extra_eos_tokens = [extra_eos_tokens]
+        include_teacher_eos = bool(
+            experiment_config.get("rollout_include_teacher_eos", True)
+        )
+        teacher_generation_eos = None
+        if include_teacher_eos:
+            teacher_generation_eos = getattr(
+                getattr(self.teacher_model, "generation_config", None),
+                "eos_token_id",
+                None,
+            )
+        self.rollout_eos_info: RolloutEOSInfo = resolve_rollout_eos(
+            self.processing_class,
+            teacher_tokenizer,
+            student_generation_eos=getattr(self.generation_config, "eos_token_id", None),
+            teacher_generation_eos=teacher_generation_eos,
+            extra_eos_tokens=extra_eos_tokens,
+            include_teacher_eos=include_teacher_eos,
+        )
+        self.rollout_eos_token_ids = list(self.rollout_eos_info.token_ids)
+        self.truncated_rollout_weight = float(
+            experiment_config.get("truncated_rollout_weight", 0.0)
+        )
+        self.repetition_ngram_size = int(
+            experiment_config.get("rollout_repetition_ngram_size", 4)
+        )
+        self.truncate_after_boxed_answer = bool(
+            experiment_config.get("rollout_truncate_after_boxed_answer", False)
+        )
+        self.append_eos_after_boxed_answer = bool(
+            experiment_config.get("rollout_append_eos_after_boxed_answer", False)
+        )
+        self.boxed_terminal_eos_token_id = (
+            self.rollout_eos_info.preferred_teacher_eos_id()
+        )
         self.schedule = HorizonSchedule(
             strategy=self.strategy,
             prefix_length=int(experiment_config["prefix_length"]),
@@ -108,6 +153,34 @@ class AdaptiveOPDTrainer(GKDTrainer):
             f"backend={self.loss_backend} mode={self.opd_loss_mode} "
             f"strategy={self.strategy} common_vocab={self.common_vocab_size}"
         )
+        self.accelerator.print(
+            "[rollout EOS] "
+            + json.dumps(
+                {
+                    "token_ids": self.rollout_eos_token_ids,
+                    "tokens": {
+                        str(token_id): self.rollout_eos_info.token_strings[token_id]
+                        for token_id in self.rollout_eos_token_ids
+                    },
+                    "sources": {
+                        str(token_id): self.rollout_eos_info.sources[token_id]
+                        for token_id in self.rollout_eos_token_ids
+                    },
+                    "pad_token_id": self.processing_class.pad_token_id,
+                    "truncated_rollout_weight": self.truncated_rollout_weight,
+                    "truncate_after_boxed_answer": self.truncate_after_boxed_answer,
+                    "append_eos_after_boxed_answer": self.append_eos_after_boxed_answer,
+                    "boxed_terminal_eos_token_id": self.boxed_terminal_eos_token_id,
+                    "boxed_terminal_eos_token": self.rollout_eos_info.token_strings[
+                        self.boxed_terminal_eos_token_id
+                    ],
+                    "loss_normalization": experiment_config.get(
+                        "loss_normalization", "per_sequence"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
 
     def _current_horizon(self) -> int:
         return self.schedule.horizon(int(self.state.global_step))
@@ -122,20 +195,43 @@ class AdaptiveOPDTrainer(GKDTrainer):
         )
         return text if max_chars is None else text[:max_chars]
 
-    def _strip_completion(self, row: torch.Tensor) -> tuple[list[int], bool]:
-        result: list[int] = []
-        eos = self.processing_class.eos_token_id
-        pad = self.processing_class.pad_token_id
-        saw_eos = False
-        for raw in row.tolist():
-            token = int(raw)
-            if pad is not None and token == int(pad):
-                break
-            result.append(token)
-            if eos is not None and token == int(eos):
-                saw_eos = True
-                break
-        return result, saw_eos
+    def _effective_rollout_horizon(
+        self,
+        model: Any,
+        inputs: dict[str, Any],
+        requested_horizon: int,
+    ) -> tuple[int, int]:
+        prompt_width = int(inputs["prompts"].shape[1])
+        configured_limit = int(
+            self.experiment_config.get(
+                "effective_max_length",
+                self.experiment_config.get("max_length", 4096),
+            )
+        )
+        model_config = getattr(model, "config", None)
+        model_limit = getattr(model_config, "max_position_embeddings", None)
+        total_limit = configured_limit
+        if model_limit is not None and int(model_limit) > 0:
+            total_limit = min(total_limit, int(model_limit))
+        available = total_limit - prompt_width
+        if available <= 0:
+            raise ValueError(
+                f"Prompt tensor width {prompt_width} leaves no rollout space under "
+                f"the effective context limit {total_limit}."
+            )
+        return min(int(requested_horizon), available), total_limit
+
+    def _strip_completion(
+        self,
+        row: torch.Tensor,
+        horizon: int,
+    ) -> TruncatedCompletion:
+        return truncate_completion(
+            row.tolist(),
+            eos_info=self.rollout_eos_info,
+            pad_token_id=self.processing_class.pad_token_id,
+            horizon=horizon,
+        )
 
     @torch.no_grad()
     def _generate_student_rollouts(
@@ -143,21 +239,28 @@ class AdaptiveOPDTrainer(GKDTrainer):
         model: Any,
         inputs: dict[str, Any],
         horizon: int,
-    ) -> tuple[list[list[int]], list[bool]]:
+    ) -> tuple[list[list[int]], list[TruncatedCompletion], int, int]:
+        effective_horizon, total_limit = self._effective_rollout_horizon(
+            model, inputs, horizon
+        )
         generation_config = copy.deepcopy(self.generation_config)
-        generation_config.max_new_tokens = int(horizon)
+        generation_config.max_new_tokens = int(effective_horizon)
         generation_config.temperature = float(self.experiment_config["temperature"])
         generation_config.do_sample = bool(self.experiment_config.get("rollout_do_sample", True))
         generation_config.top_k = int(self.experiment_config.get("top_k", 0))
         generation_config.top_p = float(self.experiment_config.get("top_p", 1.0))
+        generation_config.eos_token_id = list(self.rollout_eos_token_ids)
+        generation_config.pad_token_id = int(self.processing_class.pad_token_id)
 
         generation_kwargs = dict(self.generation_kwargs)
         generation_kwargs.update(
-            max_new_tokens=int(horizon),
+            max_new_tokens=int(effective_horizon),
             temperature=float(self.experiment_config["temperature"]),
             do_sample=bool(self.experiment_config.get("rollout_do_sample", True)),
             top_k=int(self.experiment_config.get("top_k", 0)),
             top_p=float(self.experiment_config.get("top_p", 1.0)),
+            eos_token_id=list(self.rollout_eos_token_ids),
+            pad_token_id=int(self.processing_class.pad_token_id),
         )
         with unwrap_model_for_generation(
             model,
@@ -173,19 +276,29 @@ class AdaptiveOPDTrainer(GKDTrainer):
 
         prompt_width = int(inputs["prompts"].shape[1])
         completions: list[list[int]] = []
-        eos_flags: list[bool] = []
+        metadata: list[TruncatedCompletion] = []
         for row in outputs.sequences[:, prompt_width:]:
-            ids, saw_eos = self._strip_completion(row)
-            completions.append(ids)
-            eos_flags.append(saw_eos)
-        return completions, eos_flags
+            item = self._strip_completion(row, effective_horizon)
+            item = finalize_math_completion(
+                item,
+                self.processing_class,
+                repetition_ngram_size=self.repetition_ngram_size,
+                truncate_after_boxed_answer=self.truncate_after_boxed_answer,
+                append_eos_after_boxed_answer=self.append_eos_after_boxed_answer,
+                terminal_eos_token_id=self.boxed_terminal_eos_token_id,
+            )
+            completions.append(item.token_ids)
+            metadata.append(item)
+        return completions, metadata, effective_horizon, total_limit
 
     def _build_student_batch(
         self,
         source: dict[str, Any],
         completions: list[list[int]],
-        eos_flags: list[bool],
+        metadata: list[TruncatedCompletion],
         horizon: int,
+        requested_horizon: int,
+        total_limit: int,
     ) -> dict[str, Any]:
         pad_id = int(self.processing_class.pad_token_id)
         rows: list[list[int]] = []
@@ -210,6 +323,11 @@ class AdaptiveOPDTrainer(GKDTrainer):
             padded_labels.append(label + [-100] * padding)
 
         device = source["prompts"].device
+        rollout_texts = [self._decode(ids) for ids in completions]
+        sequence_loss_weights = [
+            self.truncated_rollout_weight if item.hit_horizon else 1.0
+            for item in metadata
+        ]
         batch: dict[str, Any] = {
             "input_ids": torch.tensor(padded_ids, dtype=torch.long, device=device),
             "attention_mask": torch.tensor(padded_masks, dtype=torch.long, device=device),
@@ -219,10 +337,43 @@ class AdaptiveOPDTrainer(GKDTrainer):
             "prompt_messages": source["prompt_messages"],
             "debug_problem": source.get("problem", [""] * len(completions)),
             "debug_prompt_text": source.get("prompt_texts", [""] * len(completions)),
-            "debug_rollout_text": [self._decode(ids) for ids in completions],
+            "sequence_loss_weights": torch.tensor(
+                sequence_loss_weights, dtype=torch.float32, device=device
+            ),
+            "debug_rollout_text": rollout_texts,
+            "debug_prompt_length": [len(row) for row in prompt_rows],
             "debug_rollout_length": [len(ids) for ids in completions],
-            "debug_eos": eos_flags,
+            "debug_raw_rollout_length": [item.raw_tensor_length for item in metadata],
+            "debug_eos": [item.emitted_eos for item in metadata],
+            "debug_stop_reason": [item.stop_reason for item in metadata],
+            "debug_stop_token_id": [item.stop_token_id for item in metadata],
+            "debug_stop_token": [
+                self.rollout_eos_info.token_strings.get(item.stop_token_id, "")
+                if item.stop_token_id is not None
+                else ""
+                for item in metadata
+            ],
+            "debug_hit_horizon": [item.hit_horizon for item in metadata],
+            "debug_raw_hit_horizon": [item.raw_hit_horizon for item in metadata],
+            "debug_boxed_truncated": [item.boxed_truncated for item in metadata],
+            "debug_appended_eos": [item.appended_eos for item in metadata],
+            "debug_repeated_ngram_ratio": [
+                item.raw_repeated_ngram_ratio for item in metadata
+            ],
+            "debug_effective_repeated_ngram_ratio": [
+                repeated_ngram_ratio(ids, self.repetition_ngram_size)
+                for ids in completions
+            ],
+            # Keep this count on the raw (pre-semantic-truncation) completion so
+            # repeated-answer collapse remains visible even after safe masking.
+            "debug_boxed_count": [item.raw_boxed_count for item in metadata],
+            "debug_effective_boxed_count": [
+                text.count("\\boxed{") for text in rollout_texts
+            ],
+            "debug_sequence_loss_weight": sequence_loss_weights,
             "debug_horizon": int(horizon),
+            "debug_requested_horizon": int(requested_horizon),
+            "debug_total_length_limit": int(total_limit),
         }
         return batch
 
@@ -291,11 +442,47 @@ class AdaptiveOPDTrainer(GKDTrainer):
         )
         max_chars = int(self.experiment_config.get("debug_print_max_chars", 2500))
         for index in range(count):
+            # Keep the legacy parseable line unchanged: it now means the
+            # effective completion length after EOS/horizon truncation.
+            print(f"【student rollout length】{batch['debug_rollout_length'][index]}")
+            print(f"【student raw rollout length】{batch['debug_raw_rollout_length'][index]}")
+            print(f"【student rollout stop reason】{batch['debug_stop_reason'][index]}")
+            print(f"【student rollout stop token】{batch['debug_stop_token'][index]}")
+            print(f"【student rollout hit horizon】{batch['debug_hit_horizon'][index]}")
+            print(
+                f"【student raw rollout hit horizon】"
+                f"{batch['debug_raw_hit_horizon'][index]}"
+            )
+            print(
+                f"【student rollout truncated after boxed answer】"
+                f"{batch['debug_boxed_truncated'][index]}"
+            )
+            print(
+                f"【student rollout appended EOS】"
+                f"{batch['debug_appended_eos'][index]}"
+            )
+            print(
+                f"【student raw rollout repeated {self.repetition_ngram_size}-gram ratio】"
+                f"{batch['debug_repeated_ngram_ratio'][index]:.6f}"
+            )
+            print(
+                f"【student effective rollout repeated {self.repetition_ngram_size}-gram ratio】"
+                f"{batch['debug_effective_repeated_ngram_ratio'][index]:.6f}"
+            )
+            print(f"【student rollout boxed count】{batch['debug_boxed_count'][index]}")
+            print(
+                f"【student effective rollout boxed count】"
+                f"{batch['debug_effective_boxed_count'][index]}"
+            )
             print("\n" + "=" * 100)
             print(
                 f"[student rollout] step={self.state.global_step} sample={index} "
-                f"strategy={self.strategy} horizon={batch['debug_horizon']} "
-                f"length={batch['debug_rollout_length'][index]} eos={batch['debug_eos'][index]}"
+                f"strategy={self.strategy} requested_horizon={batch['debug_requested_horizon']} "
+                f"horizon={batch['debug_horizon']} "
+                f"prompt_length={batch['debug_prompt_length'][index]} "
+                f"length={batch['debug_rollout_length'][index]} "
+                f"eos={batch['debug_eos'][index]} "
+                f"stop_reason={batch['debug_stop_reason'][index]}"
             )
             print(batch["debug_rollout_text"][index][:max_chars])
             print("=" * 100, flush=True)
@@ -307,24 +494,103 @@ class AdaptiveOPDTrainer(GKDTrainer):
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor:
         del num_items_in_batch
-        horizon = self._current_horizon()
-        completions, eos_flags = self._generate_student_rollouts(model, inputs, horizon)
-        batch = self._build_student_batch(inputs, completions, eos_flags, horizon)
+        requested_horizon = self._current_horizon()
+        completions, metadata, horizon, total_limit = self._generate_student_rollouts(
+            model, inputs, requested_horizon
+        )
+        batch = self._build_student_batch(
+            inputs,
+            completions,
+            metadata,
+            horizon,
+            requested_horizon,
+            total_limit,
+        )
         if self.loss_backend == "sampled_rkl":
             self._build_cross_tokenizer_batch(batch)
 
         lengths = [len(ids) for ids in completions]
+        raw_lengths = [item.raw_tensor_length for item in metadata]
+        prompt_lengths = batch["debug_prompt_length"]
+        eos_flags = [item.emitted_eos for item in metadata]
+        hit_horizon = [item.hit_horizon for item in metadata]
+        raw_hit_horizon = [item.raw_hit_horizon for item in metadata]
+        boxed_truncated = [item.boxed_truncated for item in metadata]
+        appended_eos = [item.appended_eos for item in metadata]
+        stop_reasons = [item.stop_reason for item in metadata]
+        repetition = batch["debug_repeated_ngram_ratio"]
+        effective_repetition = batch["debug_effective_repeated_ngram_ratio"]
+        boxed_counts = batch["debug_boxed_count"]
         self.log(
             {
                 "rollout/horizon": float(horizon),
+                "rollout/requested_horizon": float(requested_horizon),
+                "rollout/total_length_limit": float(total_limit),
                 "rollout/mean_generated_tokens": float(sum(lengths) / max(len(lengths), 1)),
+                "rollout/raw_mean_generated_tokens": float(
+                    sum(raw_lengths) / max(len(raw_lengths), 1)
+                ),
+                "rollout/mean_removed_tokens": float(
+                    sum(raw - effective for raw, effective in zip(raw_lengths, lengths, strict=True))
+                    / max(len(lengths), 1)
+                ),
+                "rollout/mean_prompt_tokens": float(
+                    sum(prompt_lengths) / max(len(prompt_lengths), 1)
+                ),
+                "rollout/mean_total_effective_tokens": float(
+                    sum(prompt + completion for prompt, completion in zip(
+                        prompt_lengths, lengths, strict=True
+                    ))
+                    / max(len(lengths), 1)
+                ),
+                "rollout/context_limited_fraction": float(horizon < requested_horizon),
                 "rollout/median_generated_tokens": _median(lengths),
                 "rollout/max_generated_tokens": float(max(lengths) if lengths else 0),
                 "rollout/min_generated_tokens": float(min(lengths) if lengths else 0),
                 "rollout/eos_fraction": float(sum(eos_flags) / max(len(eos_flags), 1)),
                 "rollout/truncated_fraction": float(
-                    sum((not eos) and length >= horizon for length, eos in zip(lengths, eos_flags, strict=True))
-                    / max(len(lengths), 1)
+                    sum(hit_horizon) / max(len(hit_horizon), 1)
+                ),
+                "rollout/raw_truncated_fraction": float(
+                    sum(raw_hit_horizon) / max(len(raw_hit_horizon), 1)
+                ),
+                "rollout/boxed_answer_stop_fraction": float(
+                    sum(reason == "boxed_answer" for reason in stop_reasons)
+                    / max(len(stop_reasons), 1)
+                ),
+                "rollout/boxed_truncation_fraction": float(
+                    sum(boxed_truncated) / max(len(boxed_truncated), 1)
+                ),
+                "rollout/appended_eos_fraction": float(
+                    sum(appended_eos) / max(len(appended_eos), 1)
+                ),
+                "rollout/student_eos_fraction": float(
+                    sum(reason == "student_eos" for reason in stop_reasons)
+                    / max(len(stop_reasons), 1)
+                ),
+                "rollout/teacher_eos_fraction": float(
+                    sum(reason == "teacher_eos" for reason in stop_reasons)
+                    / max(len(stop_reasons), 1)
+                ),
+                "rollout/configured_eos_fraction": float(
+                    sum(reason == "configured_eos" for reason in stop_reasons)
+                    / max(len(stop_reasons), 1)
+                ),
+                "rollout/no_eos_fraction": float(
+                    sum(not flag for flag in eos_flags) / max(len(eos_flags), 1)
+                ),
+                f"rollout/repeated_{self.repetition_ngram_size}gram_ratio": float(
+                    sum(repetition) / max(len(repetition), 1)
+                ),
+                f"rollout/effective_repeated_{self.repetition_ngram_size}gram_ratio": float(
+                    sum(effective_repetition) / max(len(effective_repetition), 1)
+                ),
+                "rollout/multi_boxed_fraction": float(
+                    sum(count > 1 for count in boxed_counts) / max(len(boxed_counts), 1)
+                ),
+                "rollout/mean_sequence_loss_weight": float(
+                    sum(batch["debug_sequence_loss_weight"])
+                    / max(len(batch["debug_sequence_loss_weight"]), 1)
                 ),
             }
         )
@@ -359,10 +625,12 @@ class AdaptiveOPDTrainer(GKDTrainer):
             )
         student_lp = self._target_log_probs(student_outputs.logits, inputs["input_ids"])
         teacher_lp = self._target_log_probs(teacher_outputs.logits, inputs["teacher_input_ids"])
-        terms: list[torch.Tensor] = []
-        weights: list[int] = []
+        sequence_terms: list[torch.Tensor] = []
+        sequence_weights: list[torch.Tensor] = []
         advantages: list[float] = []
         for batch_index, groups in enumerate(inputs["alignment_groups"]):
+            terms: list[torch.Tensor] = []
+            token_count = 0
             for group in groups:
                 student_pos = [i - 1 for i in group["student"] if i > 0]
                 teacher_pos = [i - 1 for i in group["teacher"] if i > 0]
@@ -376,18 +644,26 @@ class AdaptiveOPDTrainer(GKDTrainer):
                         -float(self.rkl_advantage_clip), float(self.rkl_advantage_clip)
                     )
                 terms.append(advantage * student_logp)
-                weights.append(len(student_pos))
+                token_count += len(student_pos)
                 advantages.append(float(advantage.cpu().item()))
-        loss = (
-            torch.stack(terms).sum() / max(float(sum(weights)), 1.0)
-            if terms
-            else student_outputs.logits.sum() * 0.0
-        )
+            if terms and token_count > 0:
+                sequence_terms.append(torch.stack(terms).sum() / float(token_count))
+                sequence_weights.append(inputs["sequence_loss_weights"][batch_index])
+        if sequence_terms:
+            stacked_terms = torch.stack(sequence_terms)
+            stacked_weights = torch.stack(sequence_weights).to(stacked_terms)
+            loss = (stacked_terms * stacked_weights).sum() / stacked_weights.sum().clamp_min(1.0)
+        else:
+            loss = student_outputs.logits.sum() * 0.0
         self.log(
             {
                 "sampled_rkl/loss": float(loss.detach().cpu().item()),
-                "sampled_rkl/aligned_groups": float(len(terms)),
+                "sampled_rkl/aligned_groups": float(len(advantages)),
                 "sampled_rkl/mean_advantage": float(sum(advantages) / max(len(advantages), 1)),
+                "sampled_rkl/effective_sequence_fraction": float(
+                    sum(float(weight.detach().cpu().item()) > 0.0 for weight in sequence_weights)
+                    / max(len(sequence_weights), 1)
+                ),
             }
         )
         return (loss, student_outputs) if return_outputs else loss

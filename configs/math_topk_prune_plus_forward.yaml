@@ -8,4 +8,4 @@ prune_w_base: 0.5
 prune_cumulative: true
 # Exact comparison with math_topk_prune.yaml: only this FKL term is added.
 adaptive_forward_lambda: 0.10
-output_dir: outputs/qwen25_math_15b_to_qwen3_4b_topk16_prune_plus_fkl_t065_lam010
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_topk16_prune_plus_fkl_t065_lam010_eos_safe

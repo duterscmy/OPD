@@ -134,6 +134,29 @@ def validate_experiment_config(cfg: dict[str, Any]) -> None:
         if not 0.0 <= base <= 1.0:
             raise ValueError("prune_w_base must be in [0, 1]")
 
+    truncated_weight = float(cfg.get("truncated_rollout_weight", 0.0))
+    if not 0.0 <= truncated_weight <= 1.0:
+        raise ValueError("truncated_rollout_weight must be in [0, 1]")
+    loss_normalization = str(cfg.get("loss_normalization", "per_sequence"))
+    if loss_normalization not in {"per_sequence", "per_token"}:
+        raise ValueError("loss_normalization must be 'per_sequence' or 'per_token'")
+    if int(cfg.get("rollout_repetition_ngram_size", 4)) <= 0:
+        raise ValueError("rollout_repetition_ngram_size must be > 0")
+    if not isinstance(cfg.get("rollout_truncate_after_boxed_answer", False), bool):
+        raise ValueError("rollout_truncate_after_boxed_answer must be a boolean")
+    if not isinstance(cfg.get("rollout_append_eos_after_boxed_answer", False), bool):
+        raise ValueError("rollout_append_eos_after_boxed_answer must be a boolean")
+    if bool(cfg.get("rollout_append_eos_after_boxed_answer", False)) and not bool(
+        cfg.get("rollout_truncate_after_boxed_answer", False)
+    ):
+        raise ValueError(
+            "rollout_append_eos_after_boxed_answer requires "
+            "rollout_truncate_after_boxed_answer=true"
+        )
+    extra_eos = cfg.get("rollout_extra_eos_tokens", [])
+    if not isinstance(extra_eos, (str, list, tuple)):
+        raise ValueError("rollout_extra_eos_tokens must be a string or a list of strings")
+
     obsolete = {
         "kd_top_k": "Use reverse_top_k, forward_top_k and overlap_top_k explicitly.",
         "kl_renorm_topk": "Top-K support renormalization is always enabled.",

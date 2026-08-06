@@ -28,6 +28,24 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (values * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
 
 
+def _masked_sequence_mean(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    sequence_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Average tokens within each sequence, then average weighted sequences."""
+    counts = mask.float().sum(dim=1)
+    per_sequence = (values * mask.float()).sum(dim=1) / counts.clamp_min(1.0)
+    valid = counts.gt(0)
+    if sequence_weights is None:
+        weights = valid.float()
+    else:
+        weights = sequence_weights.to(device=values.device, dtype=values.dtype)
+        weights = weights * valid.float()
+    loss = (per_sequence * weights).sum() / weights.sum().clamp_min(1.0)
+    return loss, per_sequence
+
+
 def _masked_quantile(
     values: torch.Tensor,
     mask: torch.Tensor,
@@ -209,6 +227,7 @@ def compute_topk_opd_loss(
     labels: torch.Tensor,
     cfg: dict[str, Any],
     collect_diagnostics: bool = False,
+    sequence_weights: torch.Tensor | None = None,
 ) -> TopKOPDLossOutput:
     """Compute all Top-K OPD variants through one explicit, testable route."""
     student_logits = student_logits_raw[:, :-1, :]
@@ -284,10 +303,38 @@ def compute_topk_opd_loss(
         raise ValueError(f"Unsupported opd_loss_mode={mode!r}")
 
     token_loss = reverse_coef * reverse_loss + forward_coef * forward_loss
-    final_loss = _masked_mean(token_loss, active)
+    loss_normalization = str(cfg.get("loss_normalization", "per_sequence"))
+    if loss_normalization == "per_sequence":
+        final_loss, per_sequence_loss = _masked_sequence_mean(
+            token_loss, active, sequence_weights
+        )
+    elif loss_normalization == "per_token":
+        if sequence_weights is not None:
+            token_weights = (
+                active.float()
+                * sequence_weights.to(device=active.device, dtype=token_loss.dtype).unsqueeze(1)
+            )
+            final_loss = (token_loss * token_weights).sum() / token_weights.sum().clamp_min(1.0)
+        else:
+            final_loss = _masked_mean(token_loss, active)
+        per_sequence_loss = _masked_sequence_mean(token_loss, active)[1]
+    else:
+        raise ValueError(
+            f"Unsupported loss_normalization={loss_normalization!r}; "
+            "expected 'per_sequence' or 'per_token'."
+        )
+
+    if sequence_weights is None:
+        effective_sequence_fraction = 1.0
+    else:
+        effective_sequence_fraction = float(
+            sequence_weights.detach().float().gt(0).float().mean().cpu().item()
+        )
 
     logs: dict[str, float] = {
         "opd/loss": float(final_loss.detach().cpu().item()),
+        "opd/mean_per_sequence_loss": float(per_sequence_loss.detach().mean().cpu().item()),
+        "opd/effective_sequence_fraction": effective_sequence_fraction,
         "opd/mean_reverse_loss": float(_masked_mean(reverse_loss.detach(), active).cpu().item()),
         "opd/mean_forward_loss": float(_masked_mean(forward_loss.detach(), active).cpu().item()),
         "opd/mean_token_loss": float(_masked_mean(token_loss.detach(), active).cpu().item()),
@@ -335,6 +382,7 @@ def compute_topk_opd_loss(
         "prune_weight": prune_weight,
         "cumulative_low_overlap_count": bad_count,
         "route_code": route,
+        "per_sequence_loss": per_sequence_loss,
         "student_topk_ids": student_overlap_ids,
         "teacher_topk_ids": teacher_overlap_ids,
         "student_topk_local_prob": F.softmax(
