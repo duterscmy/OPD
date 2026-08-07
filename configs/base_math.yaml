@@ -37,9 +37,9 @@ rollout_do_sample: true
 # Rollout termination safety. Qwen2.5 uses <|endoftext|> as its native EOS,
 # while Qwen3 uses <|im_end|>; stop on either token. A hard-truncated rollout
 # is kept for diagnostics but receives zero OPD loss by default. For this math
-# task, text after the first complete boxed-answer line is also removed when no
-# EOS was emitted, preventing repeated answers from entering the OPD loss. A
-# teacher-preferred EOS is appended as a supervised terminal boundary; this is
+# task, generation stops as soon as the completion contains its first complete,
+# non-empty boxed answer. Post-generation trimming remains as a safety fallback.
+# A teacher-preferred EOS is appended as a synthetic terminal boundary; this is
 # logged separately and is never counted as a student-generated EOS.
 rollout_include_teacher_eos: true
 rollout_extra_eos_tokens:

@@ -2,5 +2,9 @@ base_config: base_math.yaml
 strategy: full
 loss_backend: adaptive_opd
 opd_loss_mode: reverse_kl
+# The rollout now stops online at the first complete boxed answer. Do not add a
+# synthetic teacher-format EOS afterward; real student/compatible EOS tokens
+# are still honored by generation.
+rollout_append_eos_after_boxed_answer: false
 gradient_accumulation_steps: 4
-output_dir: outputs/qwen25_math_15b_to_qwen3_4b_topk16_rkl_length3072_eos_safe
+output_dir: outputs/qwen25_math_15b_to_qwen3_4b_topk16_rkl_length3072_eos_safe_online

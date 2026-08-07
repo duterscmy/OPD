@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import Trainer
+from transformers import StoppingCriteria, StoppingCriteriaList, Trainer
 from trl.experimental.gkd import GKDTrainer
 from trl.models.utils import unwrap_model_for_generation
 
@@ -16,6 +16,7 @@ from .rollout_safety import (
     RolloutEOSInfo,
     TruncatedCompletion,
     finalize_math_completion,
+    first_complete_boxed_line_end,
     repeated_ngram_ratio,
     resolve_rollout_eos,
     truncate_completion,
@@ -49,6 +50,56 @@ def _median(values: list[int]) -> float:
     if len(values) % 2:
         return float(values[middle])
     return float(values[middle - 1] + values[middle]) / 2.0
+
+
+class _BoxedAnswerStoppingCriteria(StoppingCriteria):
+    """Stop each rollout as soon as its completion contains a full boxed answer.
+
+    Only completion tokens are decoded, so the empty ``\\boxed{}`` instruction in
+    the prompt cannot trigger the criterion.  ``stop_lengths`` records the exact
+    generated length before padding is added for other rows in the batch.
+    """
+
+    def __init__(self, tokenizer: Any, prompt_width: int) -> None:
+        self.tokenizer = tokenizer
+        self.prompt_width = int(prompt_width)
+        self.stop_lengths: dict[int, int] = {}
+
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor | None,
+        **kwargs: Any,
+    ) -> torch.BoolTensor:
+        del scores, kwargs
+        done = torch.zeros(
+            input_ids.shape[0],
+            dtype=torch.bool,
+            device=input_ids.device,
+        )
+        generated_width = max(int(input_ids.shape[1]) - self.prompt_width, 0)
+        if generated_width <= 0:
+            return done
+
+        for batch_index in range(int(input_ids.shape[0])):
+            if batch_index in self.stop_lengths:
+                done[batch_index] = True
+                continue
+            completion_ids = (
+                input_ids[batch_index, self.prompt_width :]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            text = self.tokenizer.decode(
+                completion_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            if first_complete_boxed_line_end(text) is not None:
+                self.stop_lengths[batch_index] = len(completion_ids)
+                done[batch_index] = True
+        return done
 
 
 class AdaptiveOPDTrainer(GKDTrainer):
@@ -262,22 +313,43 @@ class AdaptiveOPDTrainer(GKDTrainer):
             eos_token_id=list(self.rollout_eos_token_ids),
             pad_token_id=int(self.processing_class.pad_token_id),
         )
+        prompt_width = int(inputs["prompts"].shape[1])
+        boxed_stopping: _BoxedAnswerStoppingCriteria | None = None
+        stopping_criteria: StoppingCriteriaList | None = None
+        if self.truncate_after_boxed_answer:
+            boxed_stopping = _BoxedAnswerStoppingCriteria(
+                self.processing_class,
+                prompt_width=prompt_width,
+            )
+            stopping_criteria = StoppingCriteriaList([boxed_stopping])
+
+        generate_kwargs: dict[str, Any] = {
+            "input_ids": inputs["prompts"],
+            "attention_mask": inputs.get("prompt_attention_mask"),
+            "generation_config": generation_config,
+            "return_dict_in_generate": True,
+        }
+        if stopping_criteria is not None:
+            generate_kwargs["stopping_criteria"] = stopping_criteria
         with unwrap_model_for_generation(
             model,
             self.accelerator,
             generation_kwargs=generation_kwargs,
         ) as unwrapped_model:
-            outputs = unwrapped_model.generate(
-                input_ids=inputs["prompts"],
-                attention_mask=inputs.get("prompt_attention_mask"),
-                generation_config=generation_config,
-                return_dict_in_generate=True,
-            )
+            outputs = unwrapped_model.generate(**generate_kwargs)
 
-        prompt_width = int(inputs["prompts"].shape[1])
         completions: list[list[int]] = []
         metadata: list[TruncatedCompletion] = []
-        for row in outputs.sequences[:, prompt_width:]:
+        for batch_index, row in enumerate(outputs.sequences[:, prompt_width:]):
+            generation_stopped_after_boxed_answer = bool(
+                boxed_stopping is not None
+                and batch_index in boxed_stopping.stop_lengths
+            )
+            if generation_stopped_after_boxed_answer:
+                # A row that finishes before other rows may be padded by
+                # ``generate``. Slice at the exact boxed boundary so padding
+                # (which equals EOS for Qwen2.5) is not mistaken for real EOS.
+                row = row[: boxed_stopping.stop_lengths[batch_index]]
             item = self._strip_completion(row, effective_horizon)
             item = finalize_math_completion(
                 item,
@@ -286,6 +358,10 @@ class AdaptiveOPDTrainer(GKDTrainer):
                 truncate_after_boxed_answer=self.truncate_after_boxed_answer,
                 append_eos_after_boxed_answer=self.append_eos_after_boxed_answer,
                 terminal_eos_token_id=self.boxed_terminal_eos_token_id,
+                generation_stopped_after_boxed_answer=(
+                    generation_stopped_after_boxed_answer
+                ),
+                rollout_horizon=effective_horizon,
             )
             completions.append(item.token_ids)
             metadata.append(item)
@@ -531,7 +607,10 @@ class AdaptiveOPDTrainer(GKDTrainer):
                     sum(raw_lengths) / max(len(raw_lengths), 1)
                 ),
                 "rollout/mean_removed_tokens": float(
-                    sum(raw - effective for raw, effective in zip(raw_lengths, lengths, strict=True))
+                    sum(
+                        max(raw - effective, 0)
+                        for raw, effective in zip(raw_lengths, lengths, strict=True)
+                    )
                     / max(len(lengths), 1)
                 ),
                 "rollout/mean_prompt_tokens": float(

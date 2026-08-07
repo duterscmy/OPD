@@ -301,8 +301,14 @@ def finalize_math_completion(
     truncate_after_boxed_answer: bool,
     append_eos_after_boxed_answer: bool,
     terminal_eos_token_id: int,
+    generation_stopped_after_boxed_answer: bool = False,
+    rollout_horizon: int | None = None,
 ) -> TruncatedCompletion:
-    """Attach raw diagnostics and apply the optional boxed-answer boundary."""
+    """Attach raw diagnostics and apply the optional boxed-answer boundary.
+
+    ``generation_stopped_after_boxed_answer`` distinguishes a real online
+    boxed stop from the legacy fallback that trims an already generated tail.
+    """
     boxed_prefix, boxed_truncated, raw_boxed_count = truncate_after_first_boxed(
         tokenizer,
         completion.token_ids,
@@ -314,18 +320,20 @@ def finalize_math_completion(
             completion.token_ids, repetition_ngram_size
         ),
     )
-    if not (
+    apply_boxed_boundary = (
         truncate_after_boxed_answer
         and not result.emitted_eos
-        and boxed_truncated
-    ):
+        and (boxed_truncated or generation_stopped_after_boxed_answer)
+    )
+    if not apply_boxed_boundary:
         return result
 
     effective_ids = boxed_prefix
     appended_eos = False
-    if append_eos_after_boxed_answer:
-        # boxed_prefix is strictly shorter than the hard-limited completion,
-        # so one terminal token still fits within the rollout horizon.
+    can_append_eos = (
+        rollout_horizon is None or len(boxed_prefix) < int(rollout_horizon)
+    )
+    if append_eos_after_boxed_answer and can_append_eos:
         effective_ids = boxed_prefix + [int(terminal_eos_token_id)]
         appended_eos = True
     return replace(
@@ -333,6 +341,11 @@ def finalize_math_completion(
         token_ids=effective_ids,
         stop_reason="boxed_answer",
         hit_horizon=False,
+        raw_hit_horizon=(
+            False
+            if generation_stopped_after_boxed_answer
+            else result.raw_hit_horizon
+        ),
         boxed_truncated=True,
         appended_eos=appended_eos,
     )
