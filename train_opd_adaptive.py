@@ -84,6 +84,14 @@ def main() -> None:
             "resume_from_checkpoint": cfg.get("resume_from_checkpoint"),
             "debug_jsonl_enabled": cfg.get("debug_jsonl_enabled"),
             "debug_every_n_loss_calls": cfg.get("debug_every_n_loss_calls"),
+            "behavior_monitor_enabled": cfg.get("behavior_monitor_enabled", False),
+            "behavior_monitor_every_n_loss_calls": cfg.get(
+                "behavior_monitor_every_n_loss_calls", 1
+            ),
+            "behavior_probe_enabled": cfg.get("behavior_probe_enabled", False),
+            "behavior_probe_every_n_steps": cfg.get(
+                "behavior_probe_every_n_steps", 25
+            ),
         },
     )
 
@@ -199,6 +207,9 @@ def main() -> None:
                     "output_dir": str(output_dir),
                     "elapsed_minutes": round((time.time() - started) / 60.0, 3),
                     "debug_jsonl": str(trainer.debug_jsonl_path),
+                    "behavior_manifest": str(trainer.behavior_manifest_path),
+                    "behavior_probe_set": str(trainer.behavior_probe_set_path),
+                    "behavior_probe_jsonl": str(trainer.behavior_probe_jsonl_path),
                 },
                 indent=2,
             ),

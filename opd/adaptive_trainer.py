@@ -6,6 +6,10 @@ from typing import Any
 import torch
 
 from .adaptive_kl_losses import ROUTE_NAMES, TopKOPDLossOutput, compute_topk_opd_loss
+from .behavior_probabilities import (
+    flatten_probability_logs,
+    summarize_next_token_probabilities,
+)
 from .trainer import AdaptiveOPDTrainer
 
 
@@ -17,6 +21,15 @@ class AdaptiveKLTrainer(AdaptiveOPDTrainer):
             return False
         every = max(int(self.experiment_config.get("debug_every_n_loss_calls", 1)), 1)
         return self._loss_call_index % every == 0
+
+    def _should_collect_behavior_probability(self) -> bool:
+        if not self.behavior_monitor_enabled:
+            return False
+        return (
+            self._loss_call_index
+            % self.behavior_monitor_every_n_loss_calls
+            == 0
+        )
 
     @staticmethod
     def _tensor_description(tensor: torch.Tensor) -> dict[str, Any]:
@@ -239,6 +252,20 @@ class AdaptiveKLTrainer(AdaptiveOPDTrainer):
             effective_boxed_counts = inputs.get(
                 "debug_effective_boxed_count", boxed_counts
             )
+            behavior_records = inputs.get("debug_behavior", [{}] * batch_size)
+            behavior_probability = inputs.get(
+                "debug_behavior_probability_summary", {}
+            )
+            student_probability_samples = (
+                behavior_probability.get("student", {}).get("samples", [])
+                if isinstance(behavior_probability, dict)
+                else []
+            )
+            teacher_probability_samples = (
+                behavior_probability.get("teacher", {}).get("samples", [])
+                if isinstance(behavior_probability, dict)
+                else []
+            )
             sequence_loss_weights = inputs.get(
                 "debug_sequence_loss_weight", [1.0] * batch_size
             )
@@ -276,6 +303,20 @@ class AdaptiveKLTrainer(AdaptiveOPDTrainer):
                 "student_effective_boxed_count": int(
                     effective_boxed_counts[batch_index]
                 ),
+                "student_behavior": behavior_records[batch_index],
+                "behavior_probability": {
+                    "measurement": "live on-policy rollout prefixes",
+                    "student": (
+                        student_probability_samples[batch_index]
+                        if batch_index < len(student_probability_samples)
+                        else None
+                    ),
+                    "teacher": (
+                        teacher_probability_samples[batch_index]
+                        if batch_index < len(teacher_probability_samples)
+                        else None
+                    ),
+                },
                 "sequence_loss_weight": float(sequence_loss_weights[batch_index]),
                 "logged_token_count": len(token_records),
                 "student_forward": {
@@ -437,6 +478,70 @@ class AdaptiveKLTrainer(AdaptiveOPDTrainer):
             output.logs["opd/boxed_student_next_eos_probability"] = 0.0
             output.logs["opd/boxed_teacher_next_eos_probability"] = 0.0
 
+    def _add_behavior_probability_diagnostics(
+        self,
+        output: TopKOPDLossOutput,
+        student_outputs: Any,
+        teacher_outputs: Any,
+        inputs: dict[str, Any],
+    ) -> None:
+        diagnostics = output.diagnostics
+        if "student_log_z" not in diagnostics or "teacher_log_z" not in diagnostics:
+            raise RuntimeError(
+                "Behavior probability logging requires full-distribution diagnostics"
+            )
+        active = diagnostics["active"]
+        targets = diagnostics["targets"]
+        common_vocab = min(
+            int(student_outputs.logits.shape[-1]),
+            int(teacher_outputs.logits.shape[-1]),
+        )
+        student_logits = student_outputs.logits[:, :-1, :common_vocab]
+        teacher_logits = teacher_outputs.logits[:, :-1, :common_vocab]
+        student_terminal = self._final_position_logits(
+            student_outputs.logits[..., :common_vocab], inputs["attention_mask"]
+        )
+        teacher_terminal = self._final_position_logits(
+            teacher_outputs.logits[..., :common_vocab], inputs["attention_mask"]
+        )
+        completion_ids = inputs.get("student_completion_ids")
+
+        student_summary = summarize_next_token_probabilities(
+            student_logits,
+            active,
+            self.student_behavior_token_sets,
+            log_z=diagnostics["student_log_z"],
+            targets=targets,
+            terminal_logits=student_terminal,
+            completion_ids=completion_ids,
+            repetition_ngram_size=self.repetition_ngram_size,
+        )
+        teacher_summary = summarize_next_token_probabilities(
+            teacher_logits,
+            active,
+            self.teacher_behavior_token_sets,
+            log_z=diagnostics["teacher_log_z"],
+            targets=targets,
+            terminal_logits=teacher_terminal,
+            completion_ids=completion_ids,
+            repetition_ngram_size=self.repetition_ngram_size,
+        )
+        inputs["debug_behavior_probability_summary"] = {
+            "measurement": "live on-policy rollout prefixes",
+            "student": student_summary,
+            "teacher": teacher_summary,
+        }
+        output.logs.update(
+            flatten_probability_logs(
+                student_summary, prefix="behavior_online/student"
+            )
+        )
+        output.logs.update(
+            flatten_probability_logs(
+                teacher_summary, prefix="behavior_online/teacher"
+            )
+        )
+
     def compute_loss(
         self,
         model: Any,
@@ -454,6 +559,7 @@ class AdaptiveKLTrainer(AdaptiveOPDTrainer):
         del num_items_in_batch
         self._loss_call_index += 1
         collect_debug = self._should_collect_token_debug()
+        collect_behavior = self._should_collect_behavior_probability()
 
         total_start = time.perf_counter()
         student_start = time.perf_counter()
@@ -480,10 +586,17 @@ class AdaptiveKLTrainer(AdaptiveOPDTrainer):
             teacher_logits_raw=teacher_outputs.logits,
             labels=inputs["labels"],
             cfg=self.experiment_config,
-            collect_diagnostics=collect_debug,
+            collect_diagnostics=collect_debug or collect_behavior,
             sequence_weights=inputs.get("sequence_loss_weights"),
         )
         self._add_eos_diagnostics(output, student_outputs, teacher_outputs, inputs)
+        if collect_behavior:
+            self._add_behavior_probability_diagnostics(
+                output,
+                student_outputs,
+                teacher_outputs,
+                inputs,
+            )
         loss_elapsed = time.perf_counter() - loss_start
         total_elapsed = time.perf_counter() - total_start
         output.logs.update(

@@ -49,6 +49,29 @@ rollout_append_eos_after_boxed_answer: true
 truncated_rollout_weight: 0.0
 rollout_repetition_ngram_size: 4
 
+# Behaviour monitoring is diagnostic only: it never changes sampling, labels,
+# loss masks, or gradients. Existing rollout-length console lines and JSONL
+# fields remain unchanged. Online probabilities reuse the existing student and
+# teacher training forwards. The fixed probe captures one rollout once and
+# evaluates the same prefixes every 25 optimizer steps.
+behavior_monitor_enabled: true
+# Null means once per gradient-accumulation cycle (approximately once per
+# optimizer step); set an integer for a different diagnostic cadence.
+behavior_monitor_every_n_loss_calls: null
+# Keep the legacy rollout console block byte-for-byte compatible by default.
+# Set true only if a compact [student behavior] line is also wanted.
+behavior_console_enabled: false
+behavior_probe_enabled: true
+behavior_probe_every_n_steps: 25
+behavior_probe_samples: 1
+behavior_probe_max_length: 4096
+behavior_marker_manifest_path: behavior_marker_manifest_rank{rank}.json
+behavior_probe_set_path: behavior_probe_set_rank{rank}.json
+behavior_probe_jsonl_path: behavior_probe_rank{rank}.jsonl
+# To reuse exactly the same probe across experiments, point this at a copied
+# behavior_probe_set_rank{rank}.json. Null captures a new probe in output_dir.
+behavior_probe_input_path: null
+
 # Prevent long rollouts from receiving more weight merely because they contain
 # more tokens. Each sequence is token-averaged before the batch average.
 loss_normalization: per_sequence

@@ -11,6 +11,15 @@ from trl.experimental.gkd import GKDTrainer
 from trl.models.utils import unwrap_model_for_generation
 
 from .alignment import build_text_span_alignment
+from .behavior_markers import (
+    RolloutBehaviorAnalyzer,
+    aggregate_occurrence_logs,
+    compact_behavior_summary,
+)
+from .behavior_probabilities import (
+    flatten_probability_logs,
+    summarize_next_token_probabilities,
+)
 from .collator import apply_chat_template_ids
 from .rollout_safety import (
     RolloutEOSInfo,
@@ -199,6 +208,106 @@ class AdaptiveOPDTrainer(GKDTrainer):
             path = Path(self.args.output_dir) / path
         self.debug_jsonl_path = path
 
+        self.behavior_monitor_enabled = bool(
+            experiment_config.get("behavior_monitor_enabled", False)
+        )
+        self.behavior_console_enabled = bool(
+            experiment_config.get("behavior_console_enabled", False)
+        )
+        behavior_every = experiment_config.get(
+            "behavior_monitor_every_n_loss_calls"
+        )
+        if behavior_every is None:
+            behavior_every = experiment_config.get(
+                "gradient_accumulation_steps", 1
+            )
+        self.behavior_monitor_every_n_loss_calls = max(int(behavior_every), 1)
+        extra_behavior_markers = experiment_config.get(
+            "behavior_marker_dictionary"
+        )
+        focus_behavior_markers = experiment_config.get("behavior_focus_markers")
+        self.behavior_analyzer = RolloutBehaviorAnalyzer(
+            self.processing_class,
+            extra_markers=extra_behavior_markers,
+            focus_markers=focus_behavior_markers,
+        )
+        self.teacher_behavior_analyzer = RolloutBehaviorAnalyzer(
+            self.teacher_tokenizer,
+            extra_markers=extra_behavior_markers,
+            focus_markers=focus_behavior_markers,
+        )
+        self.student_behavior_token_sets = (
+            self.behavior_analyzer.probability_token_sets(
+                eos_token_ids=self.rollout_eos_token_ids
+            )
+        )
+        # adaptive_opd requires prefix-compatible token IDs, so the resolved
+        # rollout EOS IDs are also valid teacher-logit indices in this route.
+        self.teacher_behavior_token_sets = (
+            self.teacher_behavior_analyzer.probability_token_sets(
+                eos_token_ids=self.rollout_eos_token_ids
+            )
+        )
+
+        self.behavior_probe_enabled = self.behavior_monitor_enabled and bool(
+            experiment_config.get("behavior_probe_enabled", False)
+        )
+        self.behavior_probe_every_n_steps = max(
+            int(experiment_config.get("behavior_probe_every_n_steps", 25)), 1
+        )
+        self.behavior_probe_samples = max(
+            int(experiment_config.get("behavior_probe_samples", 1)), 1
+        )
+        probe_max_length = experiment_config.get("behavior_probe_max_length")
+        if probe_max_length is None:
+            probe_max_length = experiment_config.get(
+                "effective_max_length",
+                experiment_config.get("max_length", 4096),
+            )
+        self.behavior_probe_max_length = int(probe_max_length)
+        self.behavior_manifest_path = self._rank_output_path(
+            experiment_config.get(
+                "behavior_marker_manifest_path",
+                "behavior_marker_manifest_rank{rank}.json",
+            )
+        )
+        self.behavior_probe_set_path = self._rank_output_path(
+            experiment_config.get(
+                "behavior_probe_set_path", "behavior_probe_set_rank{rank}.json"
+            )
+        )
+        self.behavior_probe_jsonl_path = self._rank_output_path(
+            experiment_config.get(
+                "behavior_probe_jsonl_path", "behavior_probe_rank{rank}.jsonl"
+            )
+        )
+        probe_input = experiment_config.get("behavior_probe_input_path")
+        self.behavior_probe_input_path = (
+            Path(str(probe_input).format(rank=self.accelerator.process_index))
+            if probe_input
+            else self.behavior_probe_set_path
+        )
+        self._behavior_probe_payload: dict[str, Any] | None = None
+        self._behavior_probe_teacher_summary: dict[str, Any] | None = None
+        self._last_behavior_probe_step: int | None = None
+        if self.behavior_probe_input_path.exists():
+            self._behavior_probe_payload = json.loads(
+                self.behavior_probe_input_path.read_text(encoding="utf-8")
+            )
+            self._validate_behavior_probe_payload(self._behavior_probe_payload)
+            cached_teacher = self._behavior_probe_payload.get(
+                "teacher_probability_summary"
+            )
+            if isinstance(cached_teacher, dict):
+                self._behavior_probe_teacher_summary = cached_teacher
+        elif probe_input:
+            raise FileNotFoundError(
+                f"behavior_probe_input_path not found: {self.behavior_probe_input_path}"
+            )
+
+        if self.behavior_monitor_enabled:
+            self._write_behavior_manifest()
+
         self.accelerator.print(
             "[OPD route] "
             f"backend={self.loss_backend} mode={self.opd_loss_mode} "
@@ -232,6 +341,330 @@ class AdaptiveOPDTrainer(GKDTrainer):
                 ensure_ascii=False,
             )
         )
+        if self.behavior_monitor_enabled:
+            self.accelerator.print(
+                "[behavior monitor] "
+                + json.dumps(
+                    {
+                        "occurrence_logging": True,
+                        "probability_every_n_loss_calls": (
+                            self.behavior_monitor_every_n_loss_calls
+                        ),
+                        "fixed_probe": self.behavior_probe_enabled,
+                        "fixed_probe_every_n_steps": self.behavior_probe_every_n_steps,
+                        "fixed_probe_samples": self.behavior_probe_samples,
+                        "manifest": str(self.behavior_manifest_path),
+                        "probe_set": str(self.behavior_probe_set_path),
+                        "probe_jsonl": str(self.behavior_probe_jsonl_path),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    def _rank_output_path(self, value: Any) -> Path:
+        path = Path(str(value).format(rank=self.accelerator.process_index))
+        if not path.is_absolute():
+            path = Path(self.args.output_dir) / path
+        return path
+
+    def _write_behavior_manifest(self) -> None:
+        payload = {
+            "version": 1,
+            "rank": int(self.accelerator.process_index),
+            "student": self.behavior_analyzer.manifest(
+                eos_token_ids=self.rollout_eos_token_ids
+            ),
+            "teacher": self.teacher_behavior_analyzer.manifest(
+                eos_token_ids=self.rollout_eos_token_ids
+            ),
+            "notes": [
+                "Legacy rollout-length console lines and JSONL fields are unchanged.",
+                "Online probabilities use live rollout prefixes and are not fixed-context comparisons.",
+                "Fixed-probe probabilities use the same saved prefixes at every probe step.",
+            ],
+        }
+        self.behavior_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        self.behavior_manifest_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _validate_behavior_probe_payload(self, payload: dict[str, Any]) -> None:
+        if int(payload.get("version", -1)) != 1:
+            raise ValueError("Unsupported behavior probe set version")
+        samples = payload.get("samples")
+        if not isinstance(samples, list) or not samples:
+            raise ValueError("Behavior probe set contains no samples")
+        vocab_size = payload.get("student_tokenizer_vocab_size")
+        if vocab_size is not None and int(vocab_size) != len(self.processing_class):
+            raise ValueError(
+                "Behavior probe tokenizer vocabulary does not match the current student"
+            )
+
+    def _save_behavior_probe_payload(self) -> None:
+        if self._behavior_probe_payload is None:
+            return
+        self.behavior_probe_set_path.parent.mkdir(parents=True, exist_ok=True)
+        self.behavior_probe_set_path.write_text(
+            json.dumps(
+                self._behavior_probe_payload,
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+
+    def _capture_behavior_probe(self, batch: dict[str, Any]) -> None:
+        samples: list[dict[str, Any]] = []
+        sample_count = min(
+            self.behavior_probe_samples, int(batch["input_ids"].shape[0])
+        )
+        for batch_index in range(sample_count):
+            mask = batch["attention_mask"][batch_index].bool()
+            input_ids = [
+                int(value)
+                for value in batch["input_ids"][batch_index][mask]
+                .detach()
+                .cpu()
+                .tolist()
+            ]
+            labels = [
+                int(value)
+                for value in batch["labels"][batch_index][mask]
+                .detach()
+                .cpu()
+                .tolist()
+            ]
+            truncation = None
+            if len(input_ids) > self.behavior_probe_max_length:
+                removed = len(input_ids) - self.behavior_probe_max_length
+                input_ids = input_ids[-self.behavior_probe_max_length :]
+                labels = labels[-self.behavior_probe_max_length :]
+                truncation = {
+                    "side": "left",
+                    "removed_tokens": removed,
+                }
+            completion_ids = [
+                token_id
+                for token_id, label in zip(input_ids, labels, strict=True)
+                if label != -100
+            ]
+            samples.append(
+                {
+                    "sample_index": batch_index,
+                    "input_ids": input_ids,
+                    "labels": labels,
+                    "completion_ids": completion_ids,
+                    "sequence_length": len(input_ids),
+                    "completion_length": len(completion_ids),
+                    "truncation": truncation,
+                    "problem": batch.get("debug_problem", [""] * sample_count)[
+                        batch_index
+                    ],
+                    "prompt_text": batch.get(
+                        "debug_prompt_text", [""] * sample_count
+                    )[batch_index],
+                    "rollout_text": batch.get(
+                        "debug_rollout_text", [""] * sample_count
+                    )[batch_index],
+                }
+            )
+        self._behavior_probe_payload = {
+            "version": 1,
+            "created_global_step": int(self.state.global_step),
+            "created_rank": int(self.accelerator.process_index),
+            "student_model": str(
+                self.experiment_config.get("model_name_or_path", "")
+            ),
+            "teacher_model": str(
+                self.experiment_config.get("teacher_model_name_or_path", "")
+            ),
+            "student_tokenizer_vocab_size": len(self.processing_class),
+            "measurement": (
+                "Fixed teacher-forced prefixes captured once and reused across steps."
+            ),
+            "samples": samples,
+        }
+        self._save_behavior_probe_payload()
+
+    def _behavior_probe_tensors(
+        self,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[int]]]:
+        if self._behavior_probe_payload is None:
+            raise RuntimeError("Behavior probe set has not been initialized")
+        samples = self._behavior_probe_payload["samples"]
+        width = max(len(sample["input_ids"]) for sample in samples)
+        pad_id = int(self.processing_class.pad_token_id)
+        input_rows: list[list[int]] = []
+        mask_rows: list[list[int]] = []
+        label_rows: list[list[int]] = []
+        completion_ids: list[list[int]] = []
+        for sample in samples:
+            ids = [int(value) for value in sample["input_ids"]]
+            labels = [int(value) for value in sample["labels"]]
+            padding = width - len(ids)
+            input_rows.append(ids + [pad_id] * padding)
+            mask_rows.append([1] * len(ids) + [0] * padding)
+            label_rows.append(labels + [-100] * padding)
+            completion_ids.append(
+                [int(value) for value in sample["completion_ids"]]
+            )
+        return (
+            torch.tensor(input_rows, dtype=torch.long, device=device),
+            torch.tensor(mask_rows, dtype=torch.long, device=device),
+            torch.tensor(label_rows, dtype=torch.long, device=device),
+            completion_ids,
+        )
+
+    @staticmethod
+    def _final_position_logits(
+        logits: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        rows: list[torch.Tensor] = []
+        for batch_index in range(int(logits.shape[0])):
+            positions = torch.where(attention_mask[batch_index].bool())[0]
+            if positions.numel() == 0:
+                rows.append(logits[batch_index, 0])
+            else:
+                rows.append(logits[batch_index, int(positions[-1].item())])
+        return torch.stack(rows)
+
+    def _summarize_probe_model(
+        self,
+        module: torch.nn.Module,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        completion_ids: list[list[int]],
+        token_sets: dict[str, tuple[int, ...]],
+    ) -> dict[str, Any]:
+        was_training = bool(module.training)
+        module.eval()
+        try:
+            with torch.no_grad():
+                outputs = module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                )
+                summary = summarize_next_token_probabilities(
+                    outputs.logits[:, :-1, :],
+                    labels[:, 1:].ne(-100),
+                    token_sets,
+                    targets=labels[:, 1:],
+                    terminal_logits=self._final_position_logits(
+                        outputs.logits, attention_mask
+                    ),
+                    completion_ids=completion_ids,
+                    repetition_ngram_size=self.repetition_ngram_size,
+                )
+                del outputs
+        finally:
+            module.train(was_training)
+        return summary
+
+    def _append_behavior_probe_record(self, record: dict[str, Any]) -> None:
+        self.behavior_probe_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.behavior_probe_jsonl_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(record, ensure_ascii=False, default=str) + "\n"
+            )
+
+    def _maybe_run_fixed_behavior_probe(
+        self,
+        model: torch.nn.Module,
+        batch: dict[str, Any],
+    ) -> None:
+        if not self.behavior_probe_enabled:
+            return
+        step = int(self.state.global_step)
+        if step % self.behavior_probe_every_n_steps != 0:
+            return
+        if self._last_behavior_probe_step == step:
+            return
+        self._last_behavior_probe_step = step
+        if self._behavior_probe_payload is None:
+            self._capture_behavior_probe(batch)
+
+        input_ids, attention_mask, labels, completion_ids = (
+            self._behavior_probe_tensors(batch["input_ids"].device)
+        )
+        student_summary = self._summarize_probe_model(
+            model,
+            input_ids,
+            attention_mask,
+            labels,
+            completion_ids,
+            self.student_behavior_token_sets,
+        )
+
+        teacher_supported = self.same_tokenizer or self.prefix_compatible_tokenizer
+        if self._behavior_probe_teacher_summary is None and teacher_supported:
+            self._behavior_probe_teacher_summary = self._summarize_probe_model(
+                self.teacher_model,
+                input_ids,
+                attention_mask,
+                labels,
+                completion_ids,
+                self.teacher_behavior_token_sets,
+            )
+            assert self._behavior_probe_payload is not None
+            self._behavior_probe_payload["teacher_probability_summary"] = (
+                self._behavior_probe_teacher_summary
+            )
+            self._save_behavior_probe_payload()
+
+        record = {
+            "event": "behavior_fixed_probe",
+            "global_step": step,
+            "loss_call_index": int(self._loss_call_index),
+            "rank": int(self.accelerator.process_index),
+            "probe_created_global_step": int(
+                self._behavior_probe_payload.get("created_global_step", -1)
+            ),
+            "sample_count": len(self._behavior_probe_payload["samples"]),
+            "sequence_lengths": [
+                int(sample["sequence_length"])
+                for sample in self._behavior_probe_payload["samples"]
+            ],
+            "student": student_summary,
+            "teacher": self._behavior_probe_teacher_summary,
+            "teacher_summary_is_static": bool(
+                self._behavior_probe_teacher_summary is not None
+            ),
+        }
+        self._append_behavior_probe_record(record)
+        probe_logs = flatten_probability_logs(
+            student_summary, prefix="behavior_probe/student"
+        )
+        if self._behavior_probe_teacher_summary is not None:
+            probe_logs.update(
+                flatten_probability_logs(
+                    self._behavior_probe_teacher_summary,
+                    prefix="behavior_probe/teacher",
+                )
+            )
+        self.log(probe_logs)
+
+        if self.accelerator.is_local_main_process:
+            sets = student_summary.get("sets", {})
+            eos = sets.get("marker/eos", {})
+            planning = sets.get("category/planning", {})
+            correction = sets.get("category/self_correction", {})
+            repetition = student_summary.get("repetition_continuation") or {}
+            print(
+                "[behavior fixed probe] "
+                f"step={step} "
+                f"student_eos_mean={float(eos.get('mean', 0.0)):.8f} "
+                f"student_eos_terminal={float(eos.get('terminal_mean', 0.0)):.8f} "
+                f"student_planning={float(planning.get('mean', 0.0)):.8f} "
+                f"student_self_correction={float(correction.get('mean', 0.0)):.8f} "
+                f"student_repeat_continuation={float(repetition.get('mean_probability_at_eligible_positions', 0.0)):.8f}",
+                flush=True,
+            )
 
     def _current_horizon(self) -> int:
         return self.schedule.horizon(int(self.state.global_step))
@@ -400,6 +833,19 @@ class AdaptiveOPDTrainer(GKDTrainer):
 
         device = source["prompts"].device
         rollout_texts = [self._decode(ids) for ids in completions]
+        behavior_records = (
+            [
+                self.behavior_analyzer.analyze(
+                    ids,
+                    text,
+                    eos_token_ids=self.rollout_eos_token_ids,
+                    repetition_ngram_size=self.repetition_ngram_size,
+                )
+                for ids, text in zip(completions, rollout_texts, strict=True)
+            ]
+            if self.behavior_monitor_enabled
+            else [{} for _ in completions]
+        )
         sequence_loss_weights = [
             self.truncated_rollout_weight if item.hit_horizon else 1.0
             for item in metadata
@@ -446,6 +892,7 @@ class AdaptiveOPDTrainer(GKDTrainer):
             "debug_effective_boxed_count": [
                 text.count("\\boxed{") for text in rollout_texts
             ],
+            "debug_behavior": behavior_records,
             "debug_sequence_loss_weight": sequence_loss_weights,
             "debug_horizon": int(horizon),
             "debug_requested_horizon": int(requested_horizon),
@@ -562,6 +1009,18 @@ class AdaptiveOPDTrainer(GKDTrainer):
             )
             print(batch["debug_rollout_text"][index][:max_chars])
             print("=" * 100, flush=True)
+            if self.behavior_console_enabled and batch.get("debug_behavior"):
+                print(
+                    "[student behavior] "
+                    f"step={self.state.global_step} sample={index} "
+                    + json.dumps(
+                        compact_behavior_summary(
+                            batch["debug_behavior"][index]
+                        ),
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
 
     def training_step(
         self,
@@ -597,8 +1056,7 @@ class AdaptiveOPDTrainer(GKDTrainer):
         repetition = batch["debug_repeated_ngram_ratio"]
         effective_repetition = batch["debug_effective_repeated_ngram_ratio"]
         boxed_counts = batch["debug_boxed_count"]
-        self.log(
-            {
+        rollout_logs: dict[str, float] = {
                 "rollout/horizon": float(horizon),
                 "rollout/requested_horizon": float(requested_horizon),
                 "rollout/total_length_limit": float(total_limit),
@@ -672,8 +1130,13 @@ class AdaptiveOPDTrainer(GKDTrainer):
                     / max(len(batch["debug_sequence_loss_weight"]), 1)
                 ),
             }
-        )
+        if self.behavior_monitor_enabled:
+            rollout_logs.update(
+                aggregate_occurrence_logs(batch["debug_behavior"])
+            )
+        self.log(rollout_logs)
         self._print_rollouts(batch)
+        self._maybe_run_fixed_behavior_probe(model, batch)
         # Bypass GKDTrainer.training_step: rollout generation is handled above.
         return Trainer.training_step(self, model, batch, None)
 

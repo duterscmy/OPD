@@ -157,6 +157,42 @@ def validate_experiment_config(cfg: dict[str, Any]) -> None:
     if not isinstance(extra_eos, (str, list, tuple)):
         raise ValueError("rollout_extra_eos_tokens must be a string or a list of strings")
 
+    for key in (
+        "behavior_monitor_enabled",
+        "behavior_console_enabled",
+        "behavior_probe_enabled",
+    ):
+        if key in cfg and not isinstance(cfg[key], bool):
+            raise ValueError(f"{key} must be a boolean")
+    for key in (
+        "behavior_monitor_every_n_loss_calls",
+        "behavior_probe_every_n_steps",
+        "behavior_probe_samples",
+    ):
+        if key in cfg and cfg[key] is not None and int(cfg[key]) <= 0:
+            raise ValueError(f"{key} must be > 0")
+    if cfg.get("behavior_probe_max_length") is not None and int(
+        cfg["behavior_probe_max_length"]
+    ) <= 0:
+        raise ValueError("behavior_probe_max_length must be > 0 or null")
+    marker_dictionary = cfg.get("behavior_marker_dictionary")
+    if marker_dictionary is not None and not isinstance(marker_dictionary, dict):
+        raise ValueError("behavior_marker_dictionary must be a mapping")
+    if isinstance(marker_dictionary, dict):
+        for category, phrases in marker_dictionary.items():
+            if not isinstance(phrases, (str, list, tuple)):
+                raise ValueError(
+                    "behavior_marker_dictionary values must be strings or lists; "
+                    f"got {type(phrases).__name__} for {category!r}"
+                )
+    focus_markers = cfg.get("behavior_focus_markers")
+    if focus_markers is not None and not isinstance(focus_markers, dict):
+        raise ValueError("behavior_focus_markers must be a mapping")
+    if isinstance(focus_markers, dict) and not all(
+        isinstance(value, str) for value in focus_markers.values()
+    ):
+        raise ValueError("behavior_focus_markers values must be strings")
+
     obsolete = {
         "kd_top_k": "Use reverse_top_k, forward_top_k and overlap_top_k explicitly.",
         "kl_renorm_topk": "Top-K support renormalization is always enabled.",

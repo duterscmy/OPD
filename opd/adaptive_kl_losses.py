@@ -212,6 +212,8 @@ def _full_distribution_debug(
         teacher_logits.float().gather(-1, targets) - teacher_log_z
     ).squeeze(-1)
     return {
+        "student_log_z": student_log_z,
+        "teacher_log_z": teacher_log_z,
         "student_topk_full_prob": student_topk_full_prob,
         "teacher_topk_full_prob": teacher_topk_full_prob,
         "student_topk_mass": student_topk_full_prob.sum(dim=-1),
