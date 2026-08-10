@@ -113,4 +113,4 @@ debug_max_tokens_per_sample: 0
 debug_summary_every_n_loss_calls: 1
 debug_print_rollouts: true
 debug_print_samples: 1
-debug_print_max_chars: 2500
+debug_print_max_chars: 100000
