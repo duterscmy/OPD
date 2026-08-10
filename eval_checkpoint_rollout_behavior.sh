@@ -27,7 +27,6 @@ if [ ! -d "$EXPERIMENT_DIR" ]; then
   exit 1
 fi
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 NUM_SAMPLES=${NUM_SAMPLES:-150}
 BATCH_SIZE=${BATCH_SIZE:-4}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-3072}
@@ -56,7 +55,7 @@ echo "Extra args: $*"
 echo "Log file: $LOG_FILE"
 echo "======================================"
 
-python -u "$SCRIPT_DIR/eval_checkpoint_rollout_behavior.py" \
+python -u eval_checkpoint_rollout_behavior.py  \
   "$EXPERIMENT_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --num-samples "$NUM_SAMPLES" \
