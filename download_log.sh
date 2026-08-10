@@ -12,7 +12,7 @@ fi
 FILENAME="$1"
 
 # 远程服务器配置
-REMOTE_HOST="u6nc.aip2.isambard"
+REMOTE_HOST="u6os.aip2.isambard"
 REMOTE_PATH=""
 LOCAL_PATH="logs"
 
