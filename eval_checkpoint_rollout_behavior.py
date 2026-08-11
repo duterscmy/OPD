@@ -310,6 +310,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plots", action=argparse.BooleanOptionalAction, default=True
     )
+    parser.add_argument(
+        "--aggregate-only",
+        action="store_true",
+        help=(
+            "Rebuild CSV/JSON/PNG from completed checkpoint rollouts only; "
+            "does not import torch, load a model, or use a GPU"
+        ),
+    )
+    parser.add_argument(
+        "--plot-columns",
+        type=int,
+        default=4,
+        help="Small-multiple columns for category and marker PNGs",
+    )
+    parser.add_argument(
+        "--plot-top-markers",
+        type=int,
+        default=12,
+        help="Number of most-changing individual markers to plot",
+    )
     return parser.parse_args()
 
 
@@ -516,6 +536,8 @@ def _resolve_settings(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "local_files_only": bool(args.local_files_only),
         "save_token_ids": bool(args.save_token_ids),
+        "plot_columns": int(args.plot_columns),
+        "plot_top_markers": int(args.plot_top_markers),
     }
     if settings["num_samples"] <= 0:
         raise ValueError("--num-samples must be > 0")
@@ -527,6 +549,10 @@ def _resolve_settings(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("prompt and total length limits must be > 0")
     if settings["repetition_ngram_size"] <= 0:
         raise ValueError("--repetition-ngram-size must be > 0")
+    if settings["plot_columns"] <= 0:
+        raise ValueError("--plot-columns must be > 0")
+    if settings["plot_top_markers"] <= 0:
+        raise ValueError("--plot-top-markers must be > 0")
     if settings["do_sample"] and settings["temperature"] <= 0.0:
         raise ValueError("Sampling requires --temperature > 0")
     return settings
@@ -1276,11 +1302,31 @@ def _marker_universe(analyzer: RolloutBehaviorAnalyzer) -> list[tuple[str, str]]
     return sorted(set(markers))
 
 
+def _marker_universe_from_manifest(
+    manifest: Mapping[str, Any],
+) -> list[tuple[str, str]]:
+    markers: list[tuple[str, str]] = []
+    categories = manifest.get("categories", {})
+    if isinstance(categories, Mapping):
+        for category, phrases in categories.items():
+            if isinstance(phrases, str):
+                phrases = [phrases]
+            if isinstance(phrases, Sequence):
+                markers.extend(
+                    (str(category), str(phrase)) for phrase in phrases
+                )
+    markers.append(("termination", "<EOS>"))
+    for name, (category, _) in STRUCTURAL_PATTERNS.items():
+        markers.append((category, f"<{name}>"))
+    return sorted(set(markers))
+
+
 def _write_aggregate_outputs(
     settings: Mapping[str, Any],
     checkpoint_records: Mapping[str, Sequence[Mapping[str, Any]]],
     summaries: Sequence[Mapping[str, Any]],
-    analyzer: RolloutBehaviorAnalyzer,
+    *,
+    marker_universe: Iterable[tuple[str, str]] = (),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     output_dir = Path(str(settings["output_dir"]))
     ordered_summaries = sorted(
@@ -1308,13 +1354,263 @@ def _write_aggregate_outputs(
     marker_rows = marker_summary_rows(
         checkpoint_records,
         steps,
-        marker_universe=_marker_universe(analyzer),
+        marker_universe=marker_universe,
     )
     _write_csv(output_dir / "behavior_marker_summary.csv", marker_rows)
 
     trend_summary = overall_trend_summary(ordered_summaries, trend_rows)
     _write_json(output_dir / "length_trend_summary.json", trend_summary)
     return ordered_summaries, wide_rows, marker_rows
+
+
+def _load_completed_checkpoint_outputs(
+    output_dir: Path,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    checkpoint_root = output_dir / "checkpoints"
+    checkpoint_dirs = sorted(
+        (
+            path
+            for path in checkpoint_root.glob("checkpoint-*")
+            if path.is_dir() and re.fullmatch(r"checkpoint-\d+", path.name)
+        ),
+        key=lambda path: checkpoint_step(path.name),
+    )
+    if not checkpoint_dirs:
+        raise FileNotFoundError(
+            f"No completed checkpoint result directories found in {checkpoint_root}"
+        )
+
+    checkpoint_records: dict[str, list[dict[str, Any]]] = {}
+    summaries: list[dict[str, Any]] = []
+    for checkpoint_dir in checkpoint_dirs:
+        summary_path = checkpoint_dir / "summary.json"
+        rollout_path = checkpoint_dir / "rollouts.jsonl"
+        if not summary_path.exists() or not rollout_path.exists():
+            raise FileNotFoundError(
+                f"Incomplete result for {checkpoint_dir.name}: expected both "
+                "summary.json and rollouts.jsonl"
+            )
+        payload = _read_json(summary_path)
+        if payload.get("status") != "complete" or not isinstance(
+            payload.get("summary"), dict
+        ):
+            raise ValueError(f"Checkpoint result is not complete: {summary_path}")
+        records = _read_jsonl(rollout_path)
+        expected = int(payload["summary"].get("sample_count", len(records)))
+        if len(records) != expected:
+            raise ValueError(
+                f"{rollout_path} contains {len(records)} records; expected {expected}"
+            )
+        checkpoint_records[checkpoint_dir.name] = records
+        summaries.append(dict(payload["summary"]))
+    return checkpoint_records, summaries
+
+
+def _run_aggregate_only(
+    settings: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    output_dir = Path(str(settings["output_dir"]))
+    saved_config_path = output_dir / "resolved_eval_config.json"
+    aggregate_settings = (
+        _read_json(saved_config_path)
+        if saved_config_path.exists()
+        else dict(settings)
+    )
+    # The current path and plotting choices are presentation settings, not part
+    # of the generation fingerprint. They may safely change during replotting.
+    aggregate_settings["output_dir"] = str(output_dir)
+    aggregate_settings["plot_columns"] = int(args.plot_columns)
+    aggregate_settings["plot_top_markers"] = int(args.plot_top_markers)
+
+    checkpoint_records, summaries = _load_completed_checkpoint_outputs(
+        output_dir
+    )
+    manifest_path = output_dir / "behavior_marker_manifest.json"
+    manifest = _read_json(manifest_path) if manifest_path.exists() else {}
+    ordered_summaries, wide_rows, marker_rows = _write_aggregate_outputs(
+        aggregate_settings,
+        checkpoint_records,
+        summaries,
+        marker_universe=_marker_universe_from_manifest(manifest),
+    )
+    if args.plots:
+        _plot_outputs(
+            aggregate_settings,
+            ordered_summaries,
+            wide_rows,
+            marker_rows,
+        )
+    print(
+        "[checkpoint behavior eval] aggregate-only completed for "
+        f"{len(ordered_summaries)} checkpoints; no model was loaded; "
+        f"results written to {output_dir}",
+        flush=True,
+    )
+
+
+def _padded_axis_limits(
+    values: Sequence[float | int],
+    *,
+    lower_bound: float | None = None,
+    upper_bound: float | None = None,
+    minimum_span: float = 0.05,
+    padding_fraction: float = 0.15,
+) -> tuple[float, float]:
+    numbers = [float(value) for value in values]
+    if not numbers:
+        return (0.0, 1.0)
+    low = min(numbers)
+    high = max(numbers)
+    data_span = high - low
+    if data_span == 0.0:
+        half_span = max(minimum_span / 2.0, abs(low) * 0.05, 1e-6)
+        low -= half_span
+        high += half_span
+    else:
+        padding = max(data_span * float(padding_fraction), minimum_span * 0.05)
+        low -= padding
+        high += padding
+    if lower_bound is not None:
+        low = max(low, float(lower_bound))
+    if upper_bound is not None:
+        high = min(high, float(upper_bound))
+    if high - low < minimum_span:
+        missing = minimum_span - (high - low)
+        can_expand_down = lower_bound is None or low > float(lower_bound)
+        can_expand_up = upper_bound is None or high < float(upper_bound)
+        if can_expand_down and can_expand_up:
+            low -= missing / 2.0
+            high += missing / 2.0
+        elif can_expand_up:
+            high += missing
+        elif can_expand_down:
+            low -= missing
+    if lower_bound is not None:
+        low = max(low, float(lower_bound))
+    if upper_bound is not None:
+        high = min(high, float(upper_bound))
+    if high <= low:
+        high = low + max(minimum_span, 1e-6)
+    return low, high
+
+
+def _compact_step_ticks(steps: Sequence[int], maximum_ticks: int = 5) -> list[int]:
+    if len(steps) <= maximum_ticks:
+        return list(steps)
+    indices = [
+        round(index * (len(steps) - 1) / float(maximum_ticks - 1))
+        for index in range(maximum_ticks)
+    ]
+    return [int(steps[index]) for index in dict.fromkeys(indices)]
+
+
+def _set_compact_x_axis(axis: Any, steps: Sequence[int]) -> None:
+    axis.set_xticks(_compact_step_ticks(steps))
+    if len(steps) > 1:
+        span = float(steps[-1] - steps[0])
+        padding = max(span * 0.03, 1.0)
+        axis.set_xlim(float(steps[0]) - padding, float(steps[-1]) + padding)
+
+
+def _plot_fraction_count_small_multiples(
+    plt: Any,
+    *,
+    output_path: Path,
+    title: str,
+    steps: Sequence[int],
+    series: Mapping[str, Mapping[int, tuple[float, float]]],
+    labels: Sequence[str],
+    columns: int,
+) -> None:
+    if not labels:
+        return
+    ncols = min(max(int(columns), 1), len(labels))
+    if len(labels) > ncols and len(labels) % ncols == 1 and ncols > 2:
+        # Avoid a nearly empty final row (for example, 9 categories in 4
+        # columns is clearer as a balanced 3x3 grid).
+        ncols -= 1
+    nrows = (len(labels) + ncols - 1) // ncols
+    figure, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(3.15 * ncols, 2.55 * nrows + 0.35),
+        squeeze=False,
+    )
+    fraction_color = "C0"
+    count_color = "C1"
+    for index, label in enumerate(labels):
+        row_index, column_index = divmod(index, ncols)
+        axis = axes[row_index][column_index]
+        count_axis = axis.twinx()
+        values = series[label]
+        fractions = [float(values.get(step, (0.0, 0.0))[0]) for step in steps]
+        counts = [float(values.get(step, (0.0, 0.0))[1]) for step in steps]
+        axis.plot(
+            steps,
+            fractions,
+            color=fraction_color,
+            marker="o",
+            markersize=3.2,
+            linewidth=1.4,
+        )
+        count_axis.plot(
+            steps,
+            counts,
+            color=count_color,
+            marker="s",
+            markersize=3.0,
+            linewidth=1.25,
+        )
+        axis.set_ylim(
+            *_padded_axis_limits(
+                fractions,
+                lower_bound=0.0,
+                upper_bound=1.0,
+                minimum_span=0.06,
+            )
+        )
+        count_axis.set_ylim(
+            *_padded_axis_limits(
+                counts,
+                lower_bound=0.0,
+                minimum_span=0.10,
+            )
+        )
+        axis.set_title(label, fontsize=9)
+        axis.grid(alpha=0.20)
+        _set_compact_x_axis(axis, steps)
+        axis.tick_params(axis="both", labelsize=7)
+        count_axis.tick_params(axis="y", labelsize=7, colors=count_color)
+        axis.tick_params(axis="y", colors=fraction_color)
+        if column_index == 0:
+            axis.set_ylabel("Document fraction", color=fraction_color, fontsize=8)
+        if column_index == ncols - 1 or index == len(labels) - 1:
+            count_axis.set_ylabel("Mean count", color=count_color, fontsize=8)
+
+    for index in range(len(labels), nrows * ncols):
+        row_index, column_index = divmod(index, ncols)
+        axes[row_index][column_index].set_visible(False)
+
+    from matplotlib.lines import Line2D
+
+    figure.suptitle(title, fontsize=12)
+    figure.supxlabel("Training step", fontsize=9, y=0.012)
+    figure.legend(
+        handles=[
+            Line2D(
+                [0], [0], color=fraction_color, marker="o", label="Document fraction"
+            ),
+            Line2D([0], [0], color=count_color, marker="s", label="Mean count"),
+        ],
+        loc="upper center",
+        ncol=2,
+        bbox_to_anchor=(0.5, 0.965),
+        fontsize=8,
+    )
+    figure.tight_layout(rect=(0.0, 0.035, 1.0, 0.93))
+    figure.savefig(output_path, dpi=170)
+    plt.close(figure)
 
 
 def _plot_outputs(
@@ -1339,59 +1635,44 @@ def _plot_outputs(
     ordered = sorted(summaries, key=lambda item: int(item["checkpoint_step"]))
     steps = [int(item["checkpoint_step"]) for item in ordered]
     means = [float(item["rollout/mean_generated_tokens"]) for item in ordered]
-    medians = [float(item["rollout/median_generated_tokens"]) for item in ordered]
-    p25 = [float(item["rollout/p25_generated_tokens"]) for item in ordered]
-    p75 = [float(item["rollout/p75_generated_tokens"]) for item in ordered]
 
-    figure, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-    axes[0].fill_between(steps, p25, p75, alpha=0.2, label="P25-P75")
-    axes[0].plot(steps, means, marker="o", linewidth=2, label="Mean")
-    axes[0].plot(steps, medians, marker="s", linewidth=1.5, label="Median")
-    axes[0].set_ylabel("Rollout length (tokens)")
-    axes[0].set_title("Checkpoint rollout length trend")
-    axes[0].grid(alpha=0.25)
-    axes[0].legend()
-    axes[1].plot(
-        steps,
-        [float(item["rollout/eos_fraction"]) for item in ordered],
-        marker="o",
-        label="Native EOS",
+    # The main length PNG intentionally contains one series only. Median/IQR
+    # remain available in checkpoint_summary.csv without duplicating the plot.
+    figure, axis = plt.subplots(figsize=(6.8, 4.4))
+    axis.plot(steps, means, color="C0", marker="o", linewidth=2.2)
+    axis.set_ylim(
+        *_padded_axis_limits(means, lower_bound=0.0, minimum_span=20.0)
     )
-    axes[1].plot(
-        steps,
-        [float(item["rollout/boxed_answer_stop_fraction"]) for item in ordered],
-        marker="s",
-        label="Boxed stop",
-    )
-    axes[1].plot(
-        steps,
-        [float(item["rollout/truncated_fraction"]) for item in ordered],
-        marker="^",
-        label="Hit horizon",
-    )
-    axes[1].set_xlabel("Training step")
-    axes[1].set_ylabel("Fraction of samples")
-    axes[1].set_ylim(-0.02, 1.02)
-    axes[1].grid(alpha=0.25)
-    axes[1].legend()
+    _set_compact_x_axis(axis, steps)
+    axis.set_xlabel("Training step")
+    axis.set_ylabel("Mean rollout length (tokens)")
+    axis.set_title("Mean rollout length across checkpoints")
+    axis.grid(alpha=0.25)
     figure.tight_layout()
-    figure.savefig(output_dir / "length_trends.png", dpi=160)
+    figure.savefig(output_dir / "length_trends.png", dpi=170)
     plt.close(figure)
 
     checkpoint_names = [str(item["checkpoint"]) for item in ordered]
-    figure, axis = plt.subplots(figsize=(10, 6))
+    figure, axis = plt.subplots(figsize=(7.2, 4.8))
+    trajectory_values: list[float] = []
     for row in wide_rows:
         values = [row.get(name) for name in checkpoint_names]
         if all(value is not None for value in values):
             axis.plot(steps, values, color="C0", alpha=0.08, linewidth=0.7)
-    axis.plot(steps, means, color="C3", marker="o", linewidth=2.5, label="Mean")
+            trajectory_values.extend(float(value) for value in values)
+    if trajectory_values:
+        axis.set_ylim(
+            *_padded_axis_limits(
+                trajectory_values, lower_bound=0.0, minimum_span=20.0
+            )
+        )
+    _set_compact_x_axis(axis, steps)
     axis.set_xlabel("Training step")
     axis.set_ylabel("Rollout length (tokens)")
     axis.set_title("Per-problem rollout length trajectories")
     axis.grid(alpha=0.2)
-    axis.legend()
     figure.tight_layout()
-    figure.savefig(output_dir / "sample_length_trajectories.png", dpi=160)
+    figure.savefig(output_dir / "sample_length_trajectories.png", dpi=170)
     plt.close(figure)
 
     category_names = sorted(
@@ -1404,77 +1685,82 @@ def _plot_outputs(
         }
     )
     if category_names:
-        figure, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
+        category_series: dict[str, dict[int, tuple[float, float]]] = {}
         for category in category_names:
-            axes[0].plot(
-                steps,
-                [
+            category_series[category] = {
+                int(item["checkpoint_step"]): (
                     float(
                         item.get(
                             f"behavior_occurrence/{category}_document_fraction", 0.0
                         )
-                    )
-                    for item in ordered
-                ],
-                marker="o",
-                label=category,
-            )
-            axes[1].plot(
-                steps,
-                [
+                    ),
                     float(
                         item.get(f"behavior_occurrence/{category}_mean_count", 0.0)
-                    )
-                    for item in ordered
-                ],
-                marker="o",
-                label=category,
-            )
-        axes[0].set_ylabel("Document fraction")
-        axes[0].set_ylim(-0.02, 1.02)
-        axes[0].set_title("Behavior-category occurrence trends")
-        axes[1].set_ylabel("Mean count per rollout")
-        axes[1].set_xlabel("Training step")
-        for axis in axes:
-            axis.grid(alpha=0.2)
-            axis.legend(ncol=3, fontsize=8)
-        figure.tight_layout()
-        figure.savefig(output_dir / "behavior_category_trends.png", dpi=160)
-        plt.close(figure)
+                    ),
+                )
+                for item in ordered
+            }
+        category_labels = [category.replace("_", " ") for category in category_names]
+        _plot_fraction_count_small_multiples(
+            plt,
+            output_path=output_dir / "behavior_category_trends.png",
+            title="Behavior-category occurrence trends",
+            steps=steps,
+            series={
+                label: category_series[category]
+                for category, label in zip(
+                    category_names, category_labels, strict=True
+                )
+            },
+            labels=category_labels,
+            columns=int(settings.get("plot_columns", 4)),
+        )
 
-    marker_series: dict[tuple[str, str], dict[int, float]] = {}
+    marker_series: dict[tuple[str, str], dict[int, tuple[float, float]]] = {}
     for row in marker_rows:
         key = (str(row["category"]), str(row["marker"]))
-        marker_series.setdefault(key, {})[int(row["checkpoint_step"])] = float(
-            row["document_fraction"]
+        marker_series.setdefault(key, {})[int(row["checkpoint_step"])] = (
+            float(row["document_fraction"]),
+            float(row["mean_count"]),
         )
+
+    def marker_change_score(key: tuple[str, str]) -> tuple[float, float, float]:
+        values = marker_series[key].values()
+        fractions = [value[0] for value in values]
+        counts = [value[1] for value in values]
+        fraction_range = max(fractions) - min(fractions)
+        count_range = max(counts) - min(counts)
+        normalized_count_range = count_range / max(max(counts), 1e-12)
+        return (
+            max(fraction_range, normalized_count_range),
+            fraction_range,
+            count_range,
+        )
+
     ranked_markers = sorted(
         marker_series,
-        key=lambda key: (
-            max(marker_series[key].values()) - min(marker_series[key].values()),
-            max(marker_series[key].values()),
-        ),
+        key=marker_change_score,
         reverse=True,
-    )[:12]
+    )[: int(settings.get("plot_top_markers", 12))]
     if ranked_markers:
-        figure, axis = plt.subplots(figsize=(11, 7))
+        display_labels: list[str] = []
+        display_series: dict[str, Mapping[int, tuple[float, float]]] = {}
         for category, marker in ranked_markers:
-            series = marker_series[(category, marker)]
-            axis.plot(
-                steps,
-                [series.get(step, 0.0) for step in steps],
-                marker="o",
-                label=f"{category}: {marker}",
-            )
-        axis.set_xlabel("Training step")
-        axis.set_ylabel("Document fraction")
-        axis.set_ylim(-0.02, 1.02)
-        axis.set_title("Most-changing behavior markers")
-        axis.grid(alpha=0.2)
-        axis.legend(ncol=2, fontsize=8)
-        figure.tight_layout()
-        figure.savefig(output_dir / "behavior_marker_trends.png", dpi=160)
-        plt.close(figure)
+            marker_text = marker if len(marker) <= 24 else marker[:21] + "..."
+            label = f"{category.replace('_', ' ')}\n{marker_text}"
+            display_labels.append(label)
+            display_series[label] = marker_series[(category, marker)]
+        _plot_fraction_count_small_multiples(
+            plt,
+            output_path=output_dir / "behavior_marker_trends.png",
+            title=(
+                f"Top {len(ranked_markers)} most-changing behavior markers"
+            ),
+            steps=steps,
+            series=display_series,
+            labels=display_labels,
+            columns=int(settings.get("plot_columns", 4)),
+        )
 
 
 def main() -> None:
@@ -1483,6 +1769,10 @@ def main() -> None:
     experiment_dir = Path(str(settings["experiment_dir"]))
     output_dir = Path(str(settings["output_dir"]))
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.aggregate_only:
+        _run_aggregate_only(settings, args)
+        return
+
     checkpoints = _discover_checkpoints(args, experiment_dir)
     _infer_base_model(checkpoints, settings)
 
@@ -1566,7 +1856,10 @@ def main() -> None:
         summaries.append(summary)
 
     ordered_summaries, wide_rows, marker_rows = _write_aggregate_outputs(
-        settings, checkpoint_records, summaries, analyzer
+        settings,
+        checkpoint_records,
+        summaries,
+        marker_universe=_marker_universe(analyzer),
     )
     if args.plots:
         _plot_outputs(settings, ordered_summaries, wide_rows, marker_rows)
