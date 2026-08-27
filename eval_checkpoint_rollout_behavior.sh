@@ -76,7 +76,7 @@ echo "Log file: $LOG_FILE"
 echo "======================================"
 
 if [ "$DIAGNOSTICS_ONLY" != "1" ]; then
-  python -u "$SCRIPT_DIR/eval_checkpoint_rollout_behavior.py" \
+  python -u eval_checkpoint_rollout_behavior.py \
     "$EXPERIMENT_DIR" \
     --output-dir "$OUTPUT_DIR" \
     --num-samples "$NUM_SAMPLES" \
@@ -127,7 +127,7 @@ if [ "$RUN_LOGIT_DIAGNOSTICS" = "1" ]; then
 
   DIAGNOSTICS_LOG_FILE="${DIAGNOSTICS_OUTPUT_DIR}/logit_diagnostics_${RUN_STAMP}.log"
   mkdir -p "$DIAGNOSTICS_OUTPUT_DIR"
-  python -u "$SCRIPT_DIR/analyze_checkpoint_rollout_logits.py" \
+  python -u analyze_checkpoint_rollout_logits.py \
     "$EXPERIMENT_DIR" \
     "${DIAGNOSTIC_ARGS[@]}" 2>&1 | tee "$DIAGNOSTICS_LOG_FILE"
 fi
