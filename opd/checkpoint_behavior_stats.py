@@ -203,6 +203,10 @@ def flatten_sample_record(record: Mapping[str, Any]) -> dict[str, Any]:
         row[f"{prefix}/first_relative_position"] = item.get(
             "first_relative_position"
         )
+        token_count = max(int(behavior.get("token_count", 0)), 1)
+        row[f"{prefix}/density_per_1k"] = (
+            1000.0 * float(item.get("count", 0)) / float(token_count)
+        )
     repetition = behavior.get("repetition_continuation", {})
     for key in (
         "eligible_position_fraction",
@@ -238,8 +242,15 @@ def marker_summary_rows(
         denominator = max(len(records), 1)
         for category, marker in sorted(markers):
             counts: list[int] = []
+            token_counts: list[int] = []
             relative_positions: list[float] = []
             for record in records:
+                token_count = int(
+                    record.get("student_behavior", {}).get(
+                        "token_count", record.get("rollout_length", 0)
+                    )
+                )
+                token_counts.append(max(token_count, 0))
                 item = (
                     record.get("student_behavior", {})
                     .get("categories", {})
@@ -252,11 +263,6 @@ def marker_summary_rows(
                     continue
                 counts.append(int(item.get("count", 0)))
                 first = item.get("first_token_position")
-                token_count = int(
-                    record.get("student_behavior", {}).get(
-                        "token_count", record.get("rollout_length", 0)
-                    )
-                )
                 if first is not None and token_count > 0:
                     relative_positions.append(float(first) / float(token_count))
             rows.append(
@@ -268,6 +274,21 @@ def marker_summary_rows(
                     "document_fraction": float(sum(count > 0 for count in counts))
                     / float(denominator),
                     "mean_count": statistics.fmean(counts) if counts else 0.0,
+                    "density_per_1k": (
+                        1000.0 * float(sum(counts)) / float(sum(token_counts))
+                        if sum(token_counts) > 0
+                        else 0.0
+                    ),
+                    "mean_document_density_per_1k": (
+                        statistics.fmean(
+                            1000.0 * float(count) / float(max(token_count, 1))
+                            for count, token_count in zip(
+                                counts, token_counts, strict=True
+                            )
+                        )
+                        if counts
+                        else 0.0
+                    ),
                     "mean_first_relative_position": (
                         statistics.fmean(relative_positions)
                         if relative_positions
@@ -395,4 +416,3 @@ def overall_trend_summary(
         )
         / float(denominator),
     }
-

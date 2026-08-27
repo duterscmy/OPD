@@ -413,6 +413,12 @@ def compute_topk_opd_loss(
         _masked_mean(diagnostics["teacher_topk_local_entropy"], active).detach().cpu().item()
     )
     if collect_diagnostics:
+        diagnostics["reverse_support_teacher_local_prob"] = F.softmax(
+            teacher_logits.float().gather(-1, reverse_ids), dim=-1
+        )
+        diagnostics["forward_support_student_local_prob"] = F.softmax(
+            student_logits.float().gather(-1, forward_ids), dim=-1
+        )
         diagnostics.update(
             _full_distribution_debug(
                 student_logits,

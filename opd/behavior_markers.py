@@ -360,6 +360,170 @@ class RolloutBehaviorAnalyzer:
         except Exception:
             return 1
 
+    def marker_start_records(
+        self,
+        token_ids: Iterable[int],
+        text: str,
+        *,
+        eos_token_ids: Iterable[int] = (),
+    ) -> list[dict[str, Any]]:
+        """Return every marker start as a token-aligned diagnostic record.
+
+        The occurrence analysis above counts surface phrases.  Post-hoc OPD
+        diagnostics need a deterministic token position at which to attach the
+        next-token loss/advantage.  We attach a multi-token phrase to its first
+        emitted token and merge overlapping phrases from the same category at
+        the same position.  Positions are one-indexed within the completion.
+
+        This is deliberately a *marker-start* annotation, not a claim that the
+        whole surrounding reasoning span belongs to the category.
+        """
+
+        tokens = [int(token_id) for token_id in token_ids]
+        grouped: dict[tuple[str, int], set[str]] = defaultdict(set)
+        end_positions: dict[tuple[str, int], int] = {}
+
+        def record_match(
+            category: str,
+            position: int,
+            end_position: int,
+            marker: str,
+        ) -> None:
+            key = (str(category), int(position))
+            grouped[key].add(str(marker))
+            end_positions[key] = max(
+                int(end_positions.get(key, position)),
+                min(int(end_position), len(tokens)),
+            )
+
+        for category, phrase_map in self._category_patterns.items():
+            for phrase, pattern in phrase_map.items():
+                for match in pattern.finditer(text):
+                    position = self._token_position_from_char(text, match.start())
+                    end_position = max(
+                        position,
+                        len(_encode(self.tokenizer, text[: match.end()])),
+                    )
+                    if 1 <= position <= len(tokens):
+                        record_match(
+                            str(category), position, end_position, str(phrase)
+                        )
+
+        for name, (category, pattern) in STRUCTURAL_PATTERNS.items():
+            for match in pattern.finditer(text):
+                position = self._token_position_from_char(text, match.start())
+                end_position = max(
+                    position,
+                    len(_encode(self.tokenizer, text[: match.end()])),
+                )
+                if 1 <= position <= len(tokens):
+                    record_match(
+                        str(category), position, end_position, f"<{name}>"
+                    )
+
+        eos_set = {int(token_id) for token_id in eos_token_ids}
+        for index, token_id in enumerate(tokens, start=1):
+            if token_id in eos_set:
+                record_match("termination", index, index, "<EOS>")
+
+        return [
+            {
+                "category": category,
+                "response_position": position,
+                "response_end_position": end_positions[(category, position)],
+                "markers": sorted(markers),
+            }
+            for (category, position), markers in sorted(
+                grouped.items(), key=lambda item: (item[0][1], item[0][0])
+            )
+        ]
+
+    def exclusive_marker_span_labels(
+        self,
+        token_ids: Iterable[int],
+        text: str,
+        *,
+        eos_token_ids: Iterable[int] = (),
+        category_priority: Iterable[str] = (),
+        other_label: str = "other",
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Assign each emitted token to at most one matched marker span.
+
+        This annotation is used for category-level loss and logit-gradient
+        mass. Overlapping phrases are resolved by ``category_priority`` and
+        all non-marker tokens are labelled ``other``. Consequently every
+        reported mass share has an explicit denominator and category shares
+        (including ``other``) add to one.
+        """
+
+        tokens = [int(token_id) for token_id in token_ids]
+        marker_rows = self.marker_start_records(
+            tokens,
+            text,
+            eos_token_ids=eos_token_ids,
+        )
+        rank = {
+            str(category): index
+            for index, category in enumerate(category_priority)
+        }
+        candidates: dict[int, list[str]] = defaultdict(list)
+        for row in marker_rows:
+            start = int(row["response_position"])
+            end = int(row.get("response_end_position", start))
+            for position in range(max(start, 1), min(end, len(tokens)) + 1):
+                candidates[position].append(str(row["category"]))
+
+        labels = [str(other_label)] * len(tokens)
+        for position, categories in candidates.items():
+            labels[position - 1] = min(
+                set(categories),
+                key=lambda category: (rank.get(category, len(rank)), category),
+            )
+        return labels, marker_rows
+
+    def exclusive_marker_start_labels(
+        self,
+        token_ids: Iterable[int],
+        text: str,
+        *,
+        eos_token_ids: Iterable[int] = (),
+        category_priority: Iterable[str] = (),
+        other_label: str = "other",
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Assign one exclusive category to every emitted token.
+
+        Only marker-start positions receive a named behaviour category.  Every
+        other response token receives ``other_label``.  Exclusive labels make
+        category loss-mass shares add to exactly one; the returned marker rows
+        preserve all overlapping surface matches for inspection.
+        """
+
+        tokens = [int(token_id) for token_id in token_ids]
+        marker_rows = self.marker_start_records(
+            tokens,
+            text,
+            eos_token_ids=eos_token_ids,
+        )
+        rank = {
+            str(category): index
+            for index, category in enumerate(category_priority)
+        }
+        by_position: dict[int, list[str]] = defaultdict(list)
+        for row in marker_rows:
+            by_position[int(row["response_position"])].append(
+                str(row["category"])
+            )
+
+        labels = [str(other_label)] * len(tokens)
+        for position, categories in by_position.items():
+            selected = min(
+                set(categories),
+                key=lambda category: (rank.get(category, len(rank)), category),
+            )
+            if 1 <= position <= len(labels):
+                labels[position - 1] = selected
+        return labels, marker_rows
+
     def analyze(
         self,
         token_ids: Iterable[int],
@@ -489,6 +653,24 @@ def aggregate_occurrence_logs(records: list[dict[str, Any]]) -> dict[str, float]
         logs[f"behavior_occurrence/{category}_mean_count"] = sum(
             float(item.get("count", 0)) for item in items
         ) / float(len(items))
+        total_tokens = sum(
+            max(int(record.get("token_count", 0)), 0) for record in records
+        )
+        total_count = sum(float(item.get("count", 0)) for item in items)
+        logs[f"behavior_occurrence/{category}_density_per_1k"] = (
+            1000.0 * total_count / float(total_tokens)
+            if total_tokens > 0
+            else 0.0
+        )
+        document_densities = [
+            1000.0
+            * float(item.get("count", 0))
+            / float(max(int(record.get("token_count", 0)), 1))
+            for record, item in zip(records, items, strict=True)
+        ]
+        logs[f"behavior_occurrence/{category}_mean_document_density_per_1k"] = (
+            sum(document_densities) / float(len(document_densities))
+        )
         relative = [
             float(item["first_relative_position"])
             for item in hits
