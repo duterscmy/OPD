@@ -1,6 +1,7 @@
 base_config: base_math.yaml
 strategy: esr
 prefix_length: 200
+max_steps: 250
 loss_backend: adaptive_opd
 opd_loss_mode: reverse_kl
 output_dir: outputs/qwen25_math_15b_to_qwen3_4b_esr200_topk16_rkl_eos_safe

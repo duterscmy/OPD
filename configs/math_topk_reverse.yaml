@@ -7,4 +7,5 @@ opd_loss_mode: reverse_kl
 # are still honored by generation.
 rollout_append_eos_after_boxed_answer: false
 gradient_accumulation_steps: 4
+max_steps: 250
 output_dir: outputs/qwen25_math_15b_to_qwen3_4b_topk16_rkl_length3072_eos_safe_online
