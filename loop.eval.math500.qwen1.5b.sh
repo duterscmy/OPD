@@ -37,7 +37,7 @@ TASKS=${TASKS:-"minerva_math500"}
 BATCH_SIZE=${BATCH_SIZE:-8}
 DEVICE=${DEVICE:-"cuda:0"}
 LIMIT=${LIMIT:-}
-APPLY_CHAT_TEMPLATE=${APPLY_CHAT_TEMPLATE:-"1"}
+APPLY_CHAT_TEMPLATE=${APPLY_CHAT_TEMPLATE:-"0"}
 GEN_KWARGS=${GEN_KWARGS:-"max_gen_toks=3072,max_new_tokens=3072,temperature=0.0,do_sample=False,top_p=1.0"}
 NUM_FEWSHOT=${NUM_FEWSHOT:-0}
 
